@@ -81,6 +81,20 @@ class Document(Base):
     kind: Mapped[str | None] = mapped_column(String(50))
     kind_confidence: Mapped[float | None] = mapped_column(Float)
 
+    # The vendor this document concerns, decided once per document by the classifier.
+    #
+    # Not taken from the per-fact `subject`, which is asked of the extractor once per
+    # fact and drifts accordingly: a live run produced "Northwind Analytics LLC",
+    # "Meridian Retail Group" (the *client*) and "Meridian Retail Group and Northwind
+    # Analytics LLC" for the same vendor across one corpus. Because the register is
+    # grouped by subject, that fragmented one vendor into three and silently prevented
+    # an amendment from superseding the term it amended — the register showed both the
+    # old and new notice period, each looking authoritative.
+    #
+    # One decision, made by the pass that reads the whole document, beats N decisions
+    # made from fragments.
+    vendor: Mapped[str | None] = mapped_column(String(200))
+
     ingested_at: Mapped[datetime] = _now()
 
     __table_args__ = (

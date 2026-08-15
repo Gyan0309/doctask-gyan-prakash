@@ -24,10 +24,14 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
+from ledger.config import get_settings
 from ledger.db import session_scope
+from ledger.domain.classify import classify_document
 from ledger.domain.compose import SectionPlan, apply_plan, plan_recomposition
-from ledger.domain.extract import extract_from_chunk
-from ledger.domain.ingest import UnsupportedFormat, load_document
+from ledger.domain.extract import extract_from_document
+from ledger.domain.ingest import RawChunk, UnsupportedFormat, load_document
+from ledger.domain.normalize import normalize, normalize_date
+from ledger.domain.reconcile import FactView, reconcile
 from ledger.logging_config import get_logger, log, run_context, stage_context
 from ledger.metering import MeteredClient
 from ledger.models import Chunk, Decision, Document, Fact, Finding, Run
@@ -46,6 +50,9 @@ class RunState(TypedDict, total=False):
     document_ids: Annotated[list[str], _merge]
     fact_ids: Annotated[list[str], _merge]
     findings: Annotated[list[dict[str, Any]], _merge]
+    # Documents whose classification was too uncertain to act on. Non-empty routes the
+    # graph to the escalation node instead of straight to extraction.
+    escalations: Annotated[list[dict[str, Any]], _merge]
     plan_summary: dict[str, int]
     decisions: dict[str, str]
     status: str
@@ -194,6 +201,136 @@ def ingest(state: RunState) -> dict[str, Any]:
     return {"document_ids": document_ids, "findings": findings}
 
 
+@node("classify")
+def classify(state: RunState) -> dict[str, Any]:
+    """Identify what each document is, and how sure we are.
+
+    The confidence is not decoration. Below the configured threshold the document is
+    escalated to a human rather than processed on a guess — because document kind sets
+    precedence, and a mis-ranked document produces a register that is confidently
+    wrong. Confidently wrong is the worst outcome available to this system.
+    """
+    settings = get_settings()
+    escalations: list[dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
+
+    with session_scope() as session:
+        client = _client(session, state["run_id"])
+
+        for document_id in state.get("document_ids", []):
+            document = session.get(Document, UUID(document_id))
+            if document is None or document.kind is not None:
+                # Already classified in an earlier run. Same reasoning as fact reuse:
+                # the document's identity is its content hash, so the answer cannot
+                # have changed, and re-asking would pay for it again.
+                continue
+
+            name = Path(document.uri).name
+            text = "\n\n".join(
+                c.text
+                for c in session.query(Chunk)
+                .filter(Chunk.document_id == document.id)
+                .order_by(Chunk.ordinal)
+                .all()
+            )
+
+            result = classify_document(text, name, client)
+            document.kind = result.kind
+            document.kind_confidence = result.confidence
+            document.vendor = result.vendor or None
+
+            if result.confidence < settings.classify_confidence_threshold:
+                log(
+                    logger,
+                    logging.WARNING,
+                    "classification below threshold, escalating to a human",
+                    document=name,
+                    kind=result.kind,
+                    confidence=result.confidence,
+                    threshold=settings.classify_confidence_threshold,
+                )
+                escalations.append(
+                    {
+                        "document_id": str(document.id),
+                        "document": name,
+                        "proposed_kind": result.kind,
+                        "confidence": result.confidence,
+                        "reasoning": result.reasoning,
+                    }
+                )
+                findings.append(
+                    {
+                        "severity": "medium",
+                        "target_kind": "document",
+                        "explanation": (
+                            f"{name}: classified as {result.kind!r} with confidence "
+                            f"{result.confidence:.2f}, below the "
+                            f"{settings.classify_confidence_threshold} threshold. "
+                            f"Model's reasoning: {result.reasoning}"
+                        ),
+                    }
+                )
+            else:
+                log(
+                    logger,
+                    logging.INFO,
+                    "document classified",
+                    document=name,
+                    kind=result.kind,
+                    vendor=result.vendor,
+                    confidence=result.confidence,
+                )
+
+        client.record_stage("classify")
+
+    return {"escalations": escalations, "findings": findings}
+
+
+def route_after_classify(state: RunState) -> str:
+    """A real branch: uncertain documents take a different path through the graph.
+
+    Returns a node name, so the routing is visible in the compiled graph rather than
+    hidden inside a node as an if-statement.
+    """
+    return "escalate" if state.get("escalations") else "extract"
+
+
+@node("escalate")
+def escalate(state: RunState) -> dict[str, Any]:
+    """Ask a human what an unrecognised document is.
+
+    A separate node rather than a flag on the gate, because this question arrives
+    *before* extraction and its answer changes what gets extracted. Folding it into
+    the final review would mean extracting on a guess and asking afterwards, which is
+    the wrong order.
+    """
+    escalations = state.get("escalations", [])
+    log(logger, logging.INFO, "awaiting human classification", documents=len(escalations))
+
+    answers = interrupt(
+        {
+            "kind": "classify_documents",
+            "run_id": state["run_id"],
+            "documents": escalations,
+            "options": ["msa", "amendment", "sow", "invoice", "renewal_notice"],
+        }
+    )
+
+    applied = 0
+    with session_scope() as session:
+        for document_id, chosen_kind in (answers or {}).items():
+            document = session.get(Document, UUID(document_id))
+            if document is None or not chosen_kind:
+                continue
+            document.kind = chosen_kind
+            # A human answer is definitive; the threshold no longer applies to it.
+            document.kind_confidence = 1.0
+            applied += 1
+
+    log(logger, logging.INFO, "human classifications applied", documents=applied)
+    return {"status": "classified_by_human"}
+
+
 @node("extract")
 def extract(state: RunState) -> dict[str, Any]:
     """Extract typed facts, keeping only those with resolvable citations."""
@@ -242,74 +379,107 @@ def extract(state: RunState) -> dict[str, Any]:
             )
             name = Path(document.uri).name
 
-            for chunk in chunks:
-                from ledger.domain.ingest import RawChunk
-
-                raw = RawChunk(
-                    ordinal=chunk.ordinal,
-                    text=chunk.text,
-                    char_start=chunk.char_start,
-                    char_end=chunk.char_end,
+            raw_chunks = [
+                RawChunk(
+                    ordinal=c.ordinal,
+                    text=c.text,
+                    char_start=c.char_start,
+                    char_end=c.char_end,
                 )
-                result = extract_from_chunk(raw, name, client)
+                for c in chunks
+            ]
+            chunk_by_ordinal = {c.ordinal: c for c in chunks}
 
-                for fact in result.facts:
-                    row = Fact(
-                        document_id=document.id,
-                        chunk_id=chunk.id,
-                        predicate=fact.predicate,
-                        subject=fact.subject,
-                        value_raw=fact.value_raw,
-                        value_norm=fact.value_raw,
-                        unit=fact.unit,
-                        confidence=fact.confidence,
-                        extractor_version=EXTRACTOR_VERSION,
-                    )
-                    session.add(row)
-                    session.flush()
-                    fact_ids.append(str(row.id))
+            # One call per document, not per chunk. A term stated across a paragraph
+            # break is invisible to a model shown only one side of it.
+            result = extract_from_document(raw_chunks, name, client)
 
-                for rejection in result.rejections:
+            for fact in result.facts:
+                # Normalize here, deterministically. `value_raw` keeps what the
+                # document literally said so a conflict can quote it verbatim;
+                # `value_norm` is what comparisons run on. Keeping both is what
+                # lets the system prove a contradiction *and* show its source.
+                normalized = normalize(fact.predicate, fact.value_raw)
+                source_chunk = chunk_by_ordinal.get(fact.chunk_ordinal)
+
+                row = Fact(
+                    document_id=document.id,
+                    chunk_id=source_chunk.id if source_chunk else None,
+                    predicate=fact.predicate,
+                    subject=fact.subject,
+                    value_raw=fact.value_raw,
+                    value_norm=normalized.as_text() if normalized else None,
+                    unit=normalized.unit if normalized else fact.unit,
+                    effective_date=normalize_date(fact.effective_date),
+                    confidence=fact.confidence,
+                    extractor_version=EXTRACTOR_VERSION,
+                )
+                session.add(row)
+                session.flush()
+                fact_ids.append(str(row.id))
+
+                if normalized is None and fact.predicate != "governing_law":
+                    # Reported, not silently tolerated: an unnormalized numeric
+                    # value cannot participate in conflict detection, so it is a
+                    # gap in coverage that a human should see rather than a
+                    # cosmetic issue.
                     findings.append(
                         {
                             "severity": "low",
                             "target_kind": "fact",
                             "explanation": (
-                                f"{name}: dropped {rejection.predicate} "
-                                f"({rejection.value_raw!r}) — {rejection.reason}"
+                                f"{name}: {fact.predicate} value "
+                                f"{fact.value_raw!r} could not be normalized, so "
+                                f"it cannot be compared against other documents."
                             ),
                         }
                     )
 
-                if result.rejections:
-                    log(
-                        logger,
-                        logging.INFO,
-                        "facts dropped for unresolvable citations",
-                        document=name,
-                        kept=len(result.facts),
-                        dropped=len(result.rejections),
-                    )
+            for rejection in result.rejections:
+                findings.append(
+                    {
+                        "severity": "low",
+                        "target_kind": "fact",
+                        "explanation": (
+                            f"{name}: dropped {rejection.predicate} "
+                            f"({rejection.value_raw!r}) — {rejection.reason}"
+                        ),
+                    }
+                )
 
-                for span in result.instruction_like_spans:
-                    # I3: the attack is converted into a reportable observation.
-                    log(
-                        logger,
-                        logging.WARNING,
-                        "instruction-like text found in a source document; reported, not followed",
-                        document=name,
-                        span=span[:120],
-                    )
-                    findings.append(
-                        {
-                            "severity": "high",
-                            "target_kind": "document",
-                            "explanation": (
-                                f"{name} contains text addressed at an automated "
-                                f"system, which was reported and not acted on: {span[:200]!r}"
-                            ),
-                        }
-                    )
+            if result.rejections:
+                log(
+                    logger,
+                    logging.INFO,
+                    "facts dropped for unresolvable citations",
+                    document=name,
+                    kept=len(result.facts),
+                    dropped=len(result.rejections),
+                )
+
+            # Reported unconditionally. This sat nested under the rejection branch for
+            # one revision, which meant a document whose citations all resolved could
+            # smuggle instruction-like text past reporting entirely — the injection
+            # defence silently disabled by an unrelated success.
+            for span in result.instruction_like_spans:
+                # I3: the attack is converted into a reportable observation.
+                log(
+                    logger,
+                    logging.WARNING,
+                    "instruction-like text in a source document; reported, not followed",
+                    document=name,
+                    span=span[:120],
+                )
+                findings.append(
+                    {
+                        "severity": "high",
+                        "target_kind": "document",
+                        "explanation": (
+                            f"{name} contains text addressed at an automated "
+                            f"system, which was reported and not acted on: {span[:200]!r}"
+                        ),
+                    }
+                )
 
         client.record_stage("extract")
 
@@ -328,24 +498,80 @@ def compose(state: RunState) -> dict[str, Any]:
             else []
         )
 
-        grouped: dict[tuple[str, str], list[Fact]] = {}
-        for fact in facts:
-            grouped.setdefault((fact.subject, fact.predicate), []).append(fact)
+        # Reconcile before composing. Without this the register would list every
+        # value any document ever stated for a term, which is a pile of paper, not a
+        # register. Reconciliation picks the one that governs and keeps the rest as
+        # evidence.
+        documents = {
+            d.id: d
+            for d in session.query(Document)
+            .filter(Document.corpus_id == UUID(state["corpus_id"]))
+            .all()
+        }
 
-        desired = [
-            SectionPlan(
-                section_key=f"{subject}::{predicate}",
-                kind="register_row",
-                payload={
-                    "vendor": subject,
-                    "term": predicate,
-                    "value": sorted(f.value_raw for f in rows)[0],
-                    "sources": sorted(str(f.document_id) for f in rows),
-                },
-                fact_ids=frozenset(f.id for f in rows),
+        views = []
+        for f in facts:
+            document = documents.get(f.document_id)
+            kind = (document.kind if document else None) or "unknown"
+
+            views.append(
+                FactView(
+                    fact_id=f.id,
+                    predicate=f.predicate,
+                    # Vendor comes from the document, not the fact. See the comment on
+                    # Document.vendor — per-fact subjects drift and fragment the
+                    # register, which stops amendments from superseding the terms they
+                    # amend.
+                    subject=(
+                        document.vendor if document and document.vendor else f.subject
+                    ),
+                    value_raw=f.value_raw,
+                    value_norm=None,
+                    unit=f.unit,
+                    effective_date=f.effective_date,
+                    document_id=f.document_id,
+                    document_kind=kind,
+                    # A Statement of Work binds its own engagement. Scoping by document
+                    # keeps a specialist rate from competing with the standard rate —
+                    # without it a $210 SOW rate appears to supersede the $195
+                    # agreement rate, manufacturing a contradiction that is not real.
+                    scope=str(f.document_id) if kind == "sow" else None,
+                )
             )
-            for (subject, predicate), rows in sorted(grouped.items())
-        ]
+
+        desired = []
+        for resolution in reconcile(views):
+            governing = resolution.governing
+            contributing = (
+                [governing] if governing else []
+            ) + resolution.superseded + resolution.observations
+
+            desired.append(
+                SectionPlan(
+                    section_key=resolution.key(),
+                    kind="register_row",
+                    payload={
+                        "vendor": resolution.subject,
+                        "term": resolution.predicate,
+                        "value": governing.value_raw if governing else None,
+                        "normalized": governing.unit if governing else None,
+                        "effective_date": (
+                            governing.effective_date.isoformat()
+                            if governing and governing.effective_date
+                            else None
+                        ),
+                        "governing_source": (
+                            governing.document_kind if governing else None
+                        ),
+                        "status": resolution.status,
+                        # Superseded values stay visible. They are what a late invoice
+                        # contradicts, and hiding them would hide the finding.
+                        "superseded": [f.value_raw for f in resolution.superseded],
+                        "observed": [f.value_raw for f in resolution.observations],
+                    },
+                    fact_ids=frozenset(f.fact_id for f in contributing),
+                )
+            )
 
         prev = UUID(state["prev_run_id"]) if state.get("prev_run_id") else None
         plan = plan_recomposition(session, desired, prev_run_id=prev)
@@ -453,13 +679,25 @@ def build_graph(checkpointer=None):
     builder = StateGraph(RunState)
 
     builder.add_node("ingest", ingest)
+    builder.add_node("classify", classify)
+    builder.add_node("escalate", escalate)
     builder.add_node("extract", extract)
     builder.add_node("compose", compose)
     builder.add_node("gate", gate)
     builder.add_node("commit", commit)
 
     builder.add_edge(START, "ingest")
-    builder.add_edge("ingest", "extract")
+    builder.add_edge("ingest", "classify")
+
+    # Decision point 1: uncertain classification takes a different path. Declared as a
+    # conditional edge so it is part of the graph's shape, not an if-statement buried
+    # in a node where nothing can observe it.
+    builder.add_conditional_edges(
+        "classify",
+        route_after_classify,
+        {"escalate": "escalate", "extract": "extract"},
+    )
+    builder.add_edge("escalate", "extract")
     builder.add_edge("extract", "compose")
     builder.add_edge("compose", "gate")
     builder.add_edge("gate", "commit")

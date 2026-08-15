@@ -109,10 +109,18 @@ class FakeProvider(ModelProvider):
                 for i in range(1 + seed % 2)
             ]
         if kind in ("NUMBER", "INTEGER"):
-            # Confidence must land in [0,1] or it fails validation downstream and the
-            # stub becomes a source of fake bugs rather than a test aid.
+            # Confidently high, and deterministically so.
+            #
+            # This spanned 0.70–0.99 for one revision, which straddled the 0.75
+            # escalation threshold — so roughly a fifth of synthetic documents routed
+            # to the human gate at random, and every test downstream of classification
+            # became flaky for reasons having nothing to do with what it tested.
+            #
+            # The default path a stub produces should be the clean one. A test that
+            # wants the escalation branch scripts a low confidence explicitly, which
+            # also makes the intent visible in the test rather than emergent.
             if field_name == "confidence":
-                return round(0.7 + (seed % 30) / 100, 2)
+                return round(0.90 + (seed % 10) / 100, 2)
             return seed % 1000
         if kind == "BOOLEAN":
             return seed % 2 == 0
@@ -128,6 +136,19 @@ class FakeProvider(ModelProvider):
             lines = self._source_lines(root_prompt)
             if lines:
                 return lines[seed % len(lines)]
+
+        # Values must be *shaped* like the real thing, not merely unique. A stub
+        # returning "fake-3f5d3cf9" as an hourly rate fails normalization on every
+        # fact, so every offline run manufactures findings, parks at the human gate,
+        # and never completes — which then silently disables incrementality testing,
+        # because an incremental run needs a completed predecessor. Plausible values
+        # keep the offline path exercising the same code the real one does.
+        if field_name == "value_raw":
+            return str(50 + seed % 950)
+        if field_name == "effective_date":
+            return f"202{4 + seed % 3}-{1 + seed % 12:02d}-01"
+        if field_name in ("subject", "vendor"):
+            return f"Vendor{seed % 4}"
 
         return f"fake-{seed:08x}"
 

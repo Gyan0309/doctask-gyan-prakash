@@ -154,22 +154,51 @@ tests/              the no-key suite
 
 ---
 
+## A constraint worth knowing before you run this
+
+**The Gemini free tier allows 20 requests per day, per model** — not per minute.
+(Quota ID `GenerateRequestsPerDayPerProjectPerModel-FreeTier`, measured 2026-08-15.)
+One run over the seven-document corpus makes about 33 calls, so a single model's daily
+budget does not cover a single full run.
+
+Three things follow, and they shaped the design rather than being bolted onto it:
+
+- The default model is a **lite** model, not the largest one available.
+- `GEMINI_MODEL_FALLBACKS` lists further models tried on exhaustion. Because the cap is
+  per model, each is a separate budget. Substitutions are logged at WARNING — silently
+  answering with a model you did not configure would be its own kind of dishonesty.
+- Per-day and per-minute 429s are told apart by parsing `quotaId` out of the structured
+  error, because their human-readable messages are identical and they need opposite
+  responses: wait a moment, versus abandon this model until tomorrow.
+
+None of this affects the tests, which use the offline provider and never touch the
+network.
+
+---
+
 ## Status
 
-**Phase 1 complete.** The end-to-end path runs: ingest → extract with verified
-citations → dependency-aware compose → human gate → commit, driven entirely through
-the REST API.
+**Phase 2 complete.** Documents are classified (with a real escalation branch for low
+confidence), facts extracted with verified citations, values normalized, competing
+values reconciled to the one that governs, and the register composed from only the
+sections whose dependencies changed.
 
-Measured on a real model, not asserted:
+Measured on a real model over 7 documents, not asserted:
 
 | | Run 1 | Run 2, identical input |
 |---|---|---|
-| Sections re-derived | 4 | **0** |
-| Carried forward | 0 | **4** |
+| Wall time | 23s | **0s** |
+| Model calls | 33 | **0** |
+| Sections re-derived | 18 | **0** |
+| Carried forward | 0 | **18** |
 | Content hashes | — | **byte-identical** |
-| Model calls | 4 | **0** |
 
-Not yet built: document classification and its escalation path, conflict detection and
-adjudication, the rules engine, the fresh-eyes verifier, and the folder watcher. Those
-stages are absent rather than stubbed — a capability may be honestly missing, never
-present and broken. This README gains sections as the stages that back them land.
+The register resolves a real amendment chain: the hourly rate reports **$195 effective
+2025-07-01**, sourced to the amendment, with the superseded $180 retained as evidence
+rather than deleted. An invoice billing the old rate appears as an *observation*, never
+as an agreed term — what was billed does not get to define what was agreed.
+
+Not yet built: conflict detection and adjudication, the rules engine, the fresh-eyes
+verifier, and the folder watcher. Those stages are absent rather than stubbed — a
+capability may be honestly missing, never present and broken. This README gains
+sections as the stages that back them land.

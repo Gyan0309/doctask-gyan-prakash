@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from ledger.domain.extract import build_prompt, extract_from_chunk, resolve_citation
+from ledger.domain.extract import build_prompt, extract_from_document, resolve_citation
 from ledger.domain.ingest import RawChunk, chunk_text
 from ledger.providers.fake import FakeProvider
 
@@ -85,7 +85,7 @@ class TestExtractionDiscardsUncitedFacts:
                 "instruction_like_spans": [],
             }
         )
-        result = extract_from_chunk(_chunk(self.SCHEMA_SOURCE), "msa.md", client)
+        result = extract_from_document([_chunk(self.SCHEMA_SOURCE)], "msa.md", client)
 
         assert len(result.facts) == 1
         assert result.rejections == []
@@ -108,13 +108,40 @@ class TestExtractionDiscardsUncitedFacts:
                 "instruction_like_spans": [],
             }
         )
-        result = extract_from_chunk(_chunk(self.SCHEMA_SOURCE), "msa.md", client)
+        result = extract_from_document([_chunk(self.SCHEMA_SOURCE)], "msa.md", client)
 
         assert result.facts == []
         assert len(result.rejections) == 1
         # Rejections are reported, never silently swallowed — a fact that vanishes
         # without trace is indistinguishable from one the document never contained.
         assert "does not appear" in result.rejections[0].reason
+
+    def test_a_term_split_across_chunks_is_still_extractable(self) -> None:
+        """The reason extraction is per-document rather than per-chunk. Shown only one
+        side of a paragraph break, a model cannot know what it is missing — so the
+        loss is silent, which is the worst kind."""
+        first = RawChunk(ordinal=0, text="Payment terms are", char_start=0, char_end=17)
+        second = RawChunk(
+            ordinal=1, text="net 30 days from invoice.", char_start=18, char_end=43
+        )
+        _, client = self._client(
+            {
+                "facts": [
+                    {
+                        "predicate": "payment_terms_days",
+                        "subject": "ACME",
+                        "value_raw": "net 30",
+                        "quote": "Payment terms are net 30 days",
+                        "confidence": 0.9,
+                    }
+                ],
+                "instruction_like_spans": [],
+            }
+        )
+        result = extract_from_document([first, second], "msa.md", client)
+
+        assert len(result.facts) == 1, "a quote spanning two chunks must still resolve"
+        assert result.facts[0].chunk_ordinal == 0
 
     def test_fact_with_no_quote_at_all_is_rejected(self) -> None:
         _, client = self._client(
@@ -131,7 +158,7 @@ class TestExtractionDiscardsUncitedFacts:
                 "instruction_like_spans": [],
             }
         )
-        result = extract_from_chunk(_chunk(self.SCHEMA_SOURCE), "msa.md", client)
+        result = extract_from_document([_chunk(self.SCHEMA_SOURCE)], "msa.md", client)
         assert result.facts == []
         assert "without a citation" in result.rejections[0].reason
 

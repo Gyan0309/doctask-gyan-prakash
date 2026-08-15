@@ -32,8 +32,28 @@ class Settings(BaseSettings):
     llm_provider: str = "gemini"
 
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-3.6-flash"
+
+    # Default is a lite model, not the largest one, and that is a considered choice.
+    # The Gemini free tier caps requests **per day, per model** — measured at 20/day
+    # for gemini-3.6-flash. A seven-document corpus exhausts that in a single run, so
+    # the biggest model is the one you can least afford to make the default.
+    gemini_model: str = "gemini-3.1-flash-lite"
     gemini_model_cheap: str = "gemini-3.1-flash-lite"
+
+    # Ordered fallbacks, tried when the model above it is quota-exhausted. Because the
+    # cap is per model, a second model is a second budget — which is the difference
+    # between a run that degrades and a run that dies.
+    gemini_model_fallbacks: str = (
+        "gemini-flash-lite-latest,gemini-3-flash-preview,gemini-flash-latest"
+    )
+
+    # Outbound pacing, requests per minute. Does not address the daily cap — nothing
+    # can — but keeps bursts from tripping the per-minute limiter on top of it.
+    gemini_requests_per_minute: int = 15
+
+    @property
+    def gemini_fallback_list(self) -> list[str]:
+        return [m.strip() for m in self.gemini_model_fallbacks.split(",") if m.strip()]
 
     # --- ingestion ----------------------------------------------------------
     watch_dir: Path = Path("/data/inbox")

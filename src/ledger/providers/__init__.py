@@ -34,6 +34,8 @@ def build_provider(settings: Settings | None = None) -> ModelProvider:
             api_key=settings.gemini_api_key or "",
             model=settings.gemini_model,
             model_cheap=settings.gemini_model_cheap,
+            requests_per_minute=settings.gemini_requests_per_minute,
+            fallbacks=settings.gemini_fallback_list,
         )
 
     raise ProviderError(

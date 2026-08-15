@@ -15,6 +15,7 @@ import httpx
 
 from ledger.logging_config import get_logger, log
 from ledger.providers.base import Completion, ModelProvider, ProviderError
+from ledger.providers.ratelimit import get_limiter
 
 logger = get_logger(__name__)
 
@@ -28,6 +29,31 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 4
 BASE_BACKOFF_SECONDS = 1.5
 
+# A 429 is not like the others. The free tier's quota is per *minute*, so a backoff
+# measured in seconds is guaranteed to fail again — the window simply has not moved.
+# These get their own, longer schedule and a bigger attempt budget.
+QUOTA_BACKOFF_SECONDS = 20.0
+QUOTA_MAX_ATTEMPTS = 5
+
+
+def _is_daily_quota(resp: httpx.Response) -> bool:
+    """Is this 429 a per-day cap rather than a per-minute burst?
+
+    Google distinguishes them only in the structured `details`, via a quotaId such as
+    `GenerateRequestsPerDayPerProjectPerModel-FreeTier`. The human-readable message is
+    identical for both, so parsing prose here would be guesswork.
+    """
+    try:
+        for detail in resp.json().get("error", {}).get("details", []):
+            if "QuotaFailure" not in detail.get("@type", ""):
+                continue
+            for violation in detail.get("violations", []):
+                if "PerDay" in (violation.get("quotaId") or ""):
+                    return True
+    except Exception:
+        return False
+    return False
+
 
 class GeminiProvider(ModelProvider):
     name = "gemini"
@@ -39,6 +65,8 @@ class GeminiProvider(ModelProvider):
         model_cheap: str,
         *,
         timeout: float = 120.0,
+        requests_per_minute: int = 15,
+        fallbacks: list[str] | None = None,
     ) -> None:
         if not api_key:
             raise ProviderError(
@@ -49,6 +77,12 @@ class GeminiProvider(ModelProvider):
         self._model = model
         self._model_cheap = model_cheap
         self._timeout = timeout
+        self._fallbacks = fallbacks or []
+        # Models known to be out of daily quota. Held for the life of the process so
+        # a run does not re-discover the same exhausted model on every single call —
+        # each rediscovery costs a full round trip and a backoff.
+        self._exhausted: set[str] = set()
+        self._limiter = get_limiter("gemini", requests_per_minute)
 
     # -- internals -----------------------------------------------------------
 
@@ -87,6 +121,17 @@ class GeminiProvider(ModelProvider):
                 f"Set GEMINI_MODEL in .env to a model you have confirmed responds."
             )
 
+        if resp.status_code == 429 and _is_daily_quota(resp):
+            # Marked so the fallback layer can recognise it. A per-day exhaustion and
+            # a per-minute burst both arrive as 429, but they need opposite responses:
+            # wait a moment, versus give up on this model entirely. Treating them
+            # alike means either abandoning a run that would have recovered, or
+            # sleeping through a quota that will not return until tomorrow.
+            raise ProviderError(
+                f"__QUOTA__ {model} exhausted its free-tier daily request quota: "
+                f"{self._redact(resp.text[:250], self._key)}"
+            )
+
         if resp.status_code != 200:
             raise ProviderError(
                 f"Gemini HTTP {resp.status_code}: "
@@ -94,6 +139,55 @@ class GeminiProvider(ModelProvider):
             )
 
         return resp.json()
+
+    def _post_with_fallback(self, model: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Try the requested model, then each fallback, on daily-quota exhaustion.
+
+        The Gemini free tier limits requests **per day, per model** — 20/day for
+        gemini-3.6-flash, measured 2026-08-15. A single run over a seven-document
+        corpus exhausts that, and no retry policy can conjure more: the window is
+        tomorrow.
+
+        But because the cap is per *model*, a different model is a different budget.
+        Falling back is therefore real capacity, not a trick — and the alternative is
+        abandoning a partially completed run over a limit that a sibling model would
+        have absorbed. The substitution is logged at WARNING, because quietly answering
+        with a different model than the operator configured would be its own kind of
+        dishonesty.
+        """
+        chain = [model] + [m for m in self._fallbacks if m != model]
+        available = [m for m in chain if m not in self._exhausted] or chain[-1:]
+
+        last_quota_error: ProviderError | None = None
+
+        for index, candidate in enumerate(available):
+            try:
+                return self._post(candidate, payload)
+            except ProviderError as exc:
+                if "__QUOTA__" not in str(exc):
+                    raise
+
+                self._exhausted.add(candidate)
+                last_quota_error = exc
+                remaining = available[index + 1 :]
+
+                log(
+                    logger,
+                    logging.WARNING,
+                    "model out of daily quota, falling back"
+                    if remaining
+                    else "model out of daily quota and no fallback remains",
+                    exhausted=candidate,
+                    next_model=remaining[0] if remaining else None,
+                )
+
+        raise ProviderError(
+            f"All configured Gemini models are out of free-tier daily quota "
+            f"({', '.join(available)}). The free tier caps requests per day per "
+            f"model, so this resets tomorrow rather than in minutes. Options: add "
+            f"another model to GEMINI_MODEL_FALLBACKS, enable billing, or run with "
+            f"LLM_PROVIDER=fake.\nUnderlying: {last_quota_error}"
+        )
 
     def _post_with_retries(self, model: str, payload: dict[str, Any]) -> httpx.Response:
         """POST with backoff on transient failures.
@@ -112,8 +206,16 @@ class GeminiProvider(ModelProvider):
         more slowly.
         """
         last_error: Exception | None = None
+        attempt = 0
+        max_attempts = MAX_ATTEMPTS
 
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        while attempt < max_attempts:
+            attempt += 1
+
+            # Pace before sending, not after failing. This is what keeps the 429 from
+            # happening in the first place.
+            waited = self._limiter.acquire()
+
             started = time.monotonic()
             try:
                 with httpx.Client(timeout=self._timeout) as client:
@@ -138,17 +240,39 @@ class GeminiProvider(ModelProvider):
 
             elapsed_ms = round((time.monotonic() - started) * 1000)
 
-            if resp.status_code in RETRYABLE_STATUS and attempt < MAX_ATTEMPTS:
+            if resp.status_code == 429:
+                if _is_daily_quota(resp):
+                    # Waiting is futile — the window is tomorrow. Return immediately
+                    # so the fallback layer can switch models, which is the only
+                    # thing that actually helps. Retrying here would spend two
+                    # minutes proving what the quotaId already said.
+                    log(
+                        logger,
+                        logging.WARNING,
+                        "daily quota exhausted; not retrying, deferring to fallback",
+                        model=model,
+                    )
+                    return resp
+
+                # A per-minute burst, which *does* clear. Extend the attempt budget so
+                # the window can actually elapse — giving up after ten seconds on a
+                # limit that resets in sixty throws away work that would have landed.
+                max_attempts = QUOTA_MAX_ATTEMPTS
+
+            if resp.status_code in RETRYABLE_STATUS and attempt < max_attempts:
                 delay = self._retry_delay(resp, attempt)
                 log(
                     logger,
                     logging.WARNING,
-                    "gemini transient failure, retrying",
+                    "gemini quota exceeded, backing off"
+                    if resp.status_code == 429
+                    else "gemini transient failure, retrying",
                     model=model,
                     status=resp.status_code,
                     attempt=attempt,
-                    of=MAX_ATTEMPTS,
-                    retry_in_s=round(delay, 2),
+                    of=max_attempts,
+                    retry_in_s=round(delay, 1),
+                    paced_wait_s=round(waited, 1),
                     elapsed_ms=elapsed_ms,
                 )
                 time.sleep(delay)
@@ -161,12 +285,13 @@ class GeminiProvider(ModelProvider):
                 model=model,
                 status=resp.status_code,
                 attempt=attempt,
+                paced_wait_s=round(waited, 1),
                 elapsed_ms=elapsed_ms,
             )
             return resp
 
         raise ProviderError(  # pragma: no cover - loop always returns or raises above
-            f"Gemini failed after {MAX_ATTEMPTS} attempts: {last_error}"
+            f"Gemini failed after {max_attempts} attempts: {last_error}"
         )
 
     @staticmethod
@@ -175,9 +300,16 @@ class GeminiProvider(ModelProvider):
         header = resp.headers.get("Retry-After")
         if header:
             try:
-                return min(float(header), 30.0)
+                return min(float(header), 65.0)
             except ValueError:
                 pass
+
+        if resp.status_code == 429:
+            # Linear, not exponential, and starting high: the quota window is a fixed
+            # 60 seconds, so the useful question is "has the minute rolled over yet",
+            # which doubling answers far too slowly.
+            return min(QUOTA_BACKOFF_SECONDS * attempt, 65.0) * (0.8 + 0.4 * random.random())
+
         return BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)) * (0.5 + random.random())
 
     @staticmethod
@@ -209,7 +341,7 @@ class GeminiProvider(ModelProvider):
             "generationConfig": generation_config,
         }
 
-        data = self._post(model, body)
+        data = self._post_with_fallback(model, body)
 
         try:
             text = data["candidates"][0]["content"]["parts"][0]["text"]
