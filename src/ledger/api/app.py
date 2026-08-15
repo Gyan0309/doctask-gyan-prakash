@@ -13,15 +13,16 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from ledger import db
+from ledger import db, service
 from ledger.api.routes import router
 from ledger.config import get_settings
 from ledger.logging_config import configure_logging, get_logger, log, run_context
 from ledger.providers import build_provider
 from ledger.providers.base import ProviderError
+from ledger.watcher import Watcher
 
 _settings = get_settings()
 configure_logging(_settings.log_level, _settings.log_format)
@@ -80,9 +81,14 @@ async def log_requests(request: Request, call_next):
         return response
 
 
+_watcher: Watcher | None = None
+
+
 @app.on_event("startup")
 async def announce_startup() -> None:
+    global _watcher
     settings = get_settings()
+
     log(
         logger,
         logging.INFO,
@@ -91,7 +97,67 @@ async def announce_startup() -> None:
         provider=settings.llm_provider,
         model=settings.gemini_model,
         log_format=settings.log_format,
+        watching=settings.watch_enabled,
     )
+
+    # The watcher instance always exists; `watch_enabled` controls only whether it
+    # polls on a timer. The two were conflated at first, so /watch/poll fell back to
+    # constructing a throwaway Watcher per request — with empty state, which made every
+    # poll report every file as newly added and start a redundant run. The endpoint
+    # looked like it worked, because a run did happen each time.
+    _watcher = Watcher(
+        settings.watch_dir,
+        corpus_name=settings.watch_corpus_name,
+        interval_seconds=settings.watch_interval_seconds,
+        start_run=service.start_run,
+    )
+
+    if settings.watch_enabled:
+        # `start()` primes first, so a restart does not re-process the whole directory
+        # as though it had just arrived.
+        _watcher.start()
+
+
+@app.on_event("shutdown")
+async def stop_watcher() -> None:
+    if _watcher is not None:
+        _watcher.stop()
+
+
+@app.get("/watch")
+def watch_status() -> dict[str, Any]:
+    """Whether the watcher is running, and what it is watching."""
+    settings = get_settings()
+    return {
+        # Whether the timer loop is on. The watcher itself always exists, so
+        # /watch/poll works either way.
+        "enabled": settings.watch_enabled,
+        "polling_on_a_timer": settings.watch_enabled and _watcher is not None,
+        "directory": str(settings.watch_dir),
+        "interval_seconds": settings.watch_interval_seconds,
+        "corpus": settings.watch_corpus_name,
+    }
+
+
+@app.post("/watch/poll")
+def watch_poll() -> dict[str, Any]:
+    """Poll the watched directory once, now.
+
+    Exists so the folder-drop behaviour can be demonstrated and driven by a machine
+    without waiting on a timer — and so an operator can ask "did you see my file?"
+    and get an answer rather than a shrug.
+    """
+    if _watcher is None:  # pragma: no cover - startup always creates it
+        raise HTTPException(status_code=503, detail="watcher not initialised")
+
+    result = _watcher.poll()
+    return {
+        "added": result.added,
+        "modified": result.modified,
+        "removed": result.removed,
+        "triggered": result.triggered,
+        "run_id": result.run_id,
+    }
 
 
 @app.get("/health")

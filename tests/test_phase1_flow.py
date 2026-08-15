@@ -220,6 +220,20 @@ class TestHumanGate:
         assert resumed["status"] == "completed"
         assert service.get_run(parked_run["run_id"])["status"] == "completed"
 
+    def test_approving_nothing_still_resumes_the_run(self, parked_run) -> None:
+        """An empty decision set must not hang the run.
+
+        `Command(resume={})` does not resume: an empty dict is falsy, LangGraph reads
+        that as "no value supplied", and re-raises the interrupt — so the run re-enters
+        the gate forever with no error logged anywhere. A reviewer who approves nothing
+        is making a legitimate choice, and it deadlocked the run. Found by driving the
+        real API, not by a test.
+        """
+        resumed = service.resume_run(run_id=parked_run["run_id"], decisions={})
+
+        assert resumed["status"] == "completed"
+        assert resumed["awaiting_review"] is False
+
     def test_rejected_findings_are_recorded_as_rejected_never_deleted(
         self, parked_run
     ) -> None:

@@ -67,6 +67,7 @@ class RunState(TypedDict, total=False):
     verification_passed: bool
     verification: dict[str, Any]
     decisions: dict[str, str]
+    actor: str
     status: str
 
 
@@ -328,6 +329,11 @@ def escalate(state: RunState) -> dict[str, Any]:
             "options": ["msa", "amendment", "sow", "invoice", "renewal_notice"],
         }
     )
+
+    # Same envelope tolerance as the gate: an empty answer must resume rather than
+    # re-interrupt. "None of these needs reclassifying" is a legitimate reply.
+    if isinstance(answers, dict) and "decisions" in answers:
+        answers = answers.get("decisions") or {}
 
     applied = 0
     with session_scope() as session:
@@ -640,24 +646,47 @@ def adjudicate_conflicts(state: RunState) -> dict[str, Any]:
         results = adjudicate(candidates, client)
 
         real = 0
+        already_settled = 0
+
         for result in results:
             candidate = result.candidate
 
-            # Every candidate is persisted, including dismissed ones. I4 says never
-            # silently resolve a contradiction — and a dismissal the reviewer cannot
-            # see is exactly that, however well-reasoned it was.
-            session.add(
-                Conflict(
-                    kind=candidate.kind,
-                    severity=result.severity,
-                    status="open" if result.is_real_conflict else "dismissed",
-                    a_fact_id=candidate.a.fact_id,
-                    b_fact_id=candidate.b.fact_id,
-                    explanation=result.explanation,
-                    adjudicated=True,
-                    detected_in_run=UUID(state["run_id"]),
+            # A contradiction between the same two facts is the same contradiction,
+            # whichever run notices it. Facts are reused across runs, so re-detection
+            # is normal — and inserting a second row for it violated the uniqueness
+            # constraint and took the whole run down on the first incremental update.
+            existing = (
+                session.query(Conflict)
+                .filter(
+                    Conflict.a_fact_id == candidate.a.fact_id,
+                    Conflict.b_fact_id == candidate.b.fact_id,
+                    Conflict.kind == candidate.kind,
                 )
+                .one_or_none()
             )
+
+            if existing is None:
+                # Every candidate is persisted, including dismissed ones. I4 says never
+                # silently resolve a contradiction — and a dismissal the reviewer cannot
+                # see is exactly that, however well-reasoned it was.
+                session.add(
+                    Conflict(
+                        kind=candidate.kind,
+                        severity=result.severity,
+                        status="open" if result.is_real_conflict else "dismissed",
+                        a_fact_id=candidate.a.fact_id,
+                        b_fact_id=candidate.b.fact_id,
+                        explanation=result.explanation,
+                        adjudicated=True,
+                        detected_in_run=UUID(state["run_id"]),
+                    )
+                )
+            elif existing.status != "open":
+                # A human already ruled on this one. Re-raising it every run would
+                # teach reviewers that their decisions do not stick, which is the
+                # fastest way to make a review queue meaningless.
+                already_settled += 1
+                continue
 
             if result.is_real_conflict:
                 real += 1
@@ -681,6 +710,7 @@ def adjudicate_conflicts(state: RunState) -> dict[str, Any]:
             candidates=len(candidates),
             confirmed=real,
             dismissed=len(results) - real,
+            already_settled=already_settled,
         )
 
     return {"findings": findings}
@@ -913,14 +943,23 @@ def gate(state: RunState) -> dict[str, Any]:
 
     log(logger, logging.INFO, "presenting findings for human review", pending=len(findings))
 
-    decisions = interrupt(
+    answer = interrupt(
         {
             "kind": "review_findings",
             "run_id": state["run_id"],
             "findings": [{"index": i, **f} for i, f in enumerate(findings)],
         }
     )
-    return {"decisions": decisions or {}, "status": "reviewed"}
+
+    # The resume value is an envelope (see service.resume_run). A bare mapping is still
+    # accepted so a caller driving the graph directly does not have to know that.
+    if isinstance(answer, dict) and "decisions" in answer:
+        decisions = answer.get("decisions") or {}
+        actor = answer.get("actor") or "human"
+    else:
+        decisions, actor = (answer or {}), "human"
+
+    return {"decisions": decisions, "actor": actor, "status": "reviewed"}
 
 
 @node("commit")
@@ -953,7 +992,7 @@ def commit(state: RunState) -> dict[str, Any]:
                     kind="finding",
                     target_id=finding.id,
                     verdict="approved" if verdict == "approved" else "rejected",
-                    actor=decisions.get("_actor", "human"),
+                    actor=state.get("actor") or "human",
                 )
             )
 

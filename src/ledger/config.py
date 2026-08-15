@@ -61,6 +61,14 @@ class Settings(BaseSettings):
     # --- ingestion ----------------------------------------------------------
     watch_dir: Path = Path("/data/inbox")
 
+    # The watcher is opt-in. Enabled by default it would start runs the moment the
+    # service boots, spending a 20-request-per-day budget on work nobody asked for —
+    # and a system that acts on its own before you have configured it is a system
+    # people learn to distrust.
+    watch_enabled: bool = False
+    watch_interval_seconds: float = 5.0
+    watch_corpus_name: str = "watched"
+
     # --- rules --------------------------------------------------------------
     # The contract playbook. A new rule is an edit to this file, never to code.
     rules_path: Path = Path("rules/playbook.yaml")

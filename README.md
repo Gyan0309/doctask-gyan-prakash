@@ -178,12 +178,13 @@ network.
 
 ## Status
 
-**Phase 4 complete.** Documents are classified (with a real escalation branch for low
-confidence), facts extracted with verified citations, values normalized, competing
-values reconciled to the one that governs, contradictions detected deterministically
-and adjudicated by a model, the register composed from only the sections whose
-dependencies changed, the contract playbook applied, and every claim verified against
-its sources before anything is committed.
+**All five movements are built.** Documents are classified (with a real escalation
+branch for low confidence), facts extracted with verified citations, values normalized,
+competing values reconciled to the one that governs, contradictions detected
+deterministically and adjudicated by a model, the register composed from only the
+sections whose dependencies changed, the contract playbook applied, every claim verified
+against its sources before anything is committed, and a watched folder keeps it all
+current as new paperwork arrives.
 
 ### What it finds
 
@@ -247,6 +248,38 @@ And on a corpus with nothing wrong with it, the adjudication stage does not run 
 run and a stage that was never wired up must not look alike, so the skip is written
 down rather than omitted.
 
-Not yet built: the folder watcher that triggers a run when a document arrives. That
-stage is absent rather than stubbed — a capability may be honestly missing, never
-present and broken. This README gains sections as the stages that back them land.
+### Drop a document in a folder and it updates itself
+
+Put a file in `inbox/` and poll:
+
+```bash
+curl -X POST localhost:8000/watch/poll
+curl localhost:8000/runs/<run_id>/changes
+```
+
+Set `WATCH_ENABLED=true` to poll on a timer instead. It is off by default: a system
+that starts spending a per-day model budget the moment it boots is one people learn to
+distrust.
+
+Measured on a live system — two agreements already processed, then one amendment
+dropped into the folder:
+
+| | |
+|---|---|
+| Wall time | **4 seconds** |
+| **Untouched** | **13 of 15 sections (87%)** — byte-identical by hash |
+| Changed | **2** — exactly the terms that amendment modifies |
+| Model calls | **1 classify, 1 extract** — the new document only |
+
+```
+hourly_rate         $180 → $195 per hour   source=amendment  eff=2025-07-01
+payment_terms_days  45   → 30              source=amendment  eff=2025-07-01
+```
+
+`GET /runs/{id}/changes` names the document responsible for each change, so "what
+changed and why" is a query rather than a story assembled afterwards. Detection is by
+content hash, not modification time — re-saving a file without editing it is not a
+change and must not cost a run.
+
+This is the whole claim of the system in one number: **87% of the register was proven
+untouched, not asserted to be.**

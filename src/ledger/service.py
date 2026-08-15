@@ -21,6 +21,7 @@ from sqlalchemy import select
 
 from ledger.config import get_settings
 from ledger.db import session_scope
+from ledger.domain.changes import build_ledger
 from ledger.graph import build_graph
 from ledger.logging_config import get_logger, log, run_context, timed
 from ledger.models import Corpus, Decision, Finding, Run, SectionVersion, StageMetric
@@ -156,7 +157,11 @@ def start_run(
 
 
 def resume_run(
-    *, run_id: str, thread_id: str | None = None, decisions: dict[str, str]
+    *,
+    run_id: str,
+    thread_id: str | None = None,
+    decisions: dict[str, str],
+    actor: str = "human",
 ) -> dict[str, Any]:
     """Resume a run parked at the gate with per-item verdicts."""
     graph = build_graph(get_checkpointer())
@@ -172,7 +177,17 @@ def resume_run(
             rejected=len(decisions) - approved,
         )
         with timed(logger, "resume", run_id=run_id):
-            state = graph.invoke(Command(resume=decisions), config)
+            # Always an envelope, never the bare mapping.
+            #
+            # `Command(resume={})` does not resume: an empty dict is falsy, LangGraph
+            # reads that as "no value supplied", and re-raises the interrupt. The run
+            # then re-enters the gate forever — so a reviewer who rejects everything,
+            # or approves nothing, hangs the run with no error anywhere. Wrapping the
+            # decisions in a dict that always has keys makes the resume value truthy
+            # by construction.
+            state = graph.invoke(
+                Command(resume={"decisions": decisions, "actor": actor}), config
+            )
         return _describe(run_id, state, config)
 
 
@@ -270,6 +285,29 @@ def get_deliverable(run_id: str) -> dict[str, Any]:
             ],
             "carried_forward": sum(1 for v in versions if v.carried_forward),
             "rederived": sum(1 for v in versions if not v.carried_forward),
+        }
+
+
+def get_changes(run_id: str) -> dict[str, Any]:
+    """What changed in this run, and because of which document.
+
+    The other half of the incrementality claim: `get_deliverable` shows the hashes,
+    this shows the causal chain from an arriving document to the rows it moved.
+    """
+    with session_scope() as session:
+        ledger = build_ledger(session, UUID(run_id))
+        return {
+            **ledger.summary(),
+            "sections": [
+                {
+                    "section_key": change.section_key,
+                    "status": change.status,
+                    "content_hash": change.content_hash,
+                    "previous_hash": change.previous_hash,
+                    "caused_by": change.caused_by,
+                }
+                for change in ledger.changes
+            ],
         }
 
 

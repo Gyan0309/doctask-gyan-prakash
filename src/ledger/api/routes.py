@@ -67,6 +67,15 @@ def get_deliverable(run_id: str) -> dict[str, Any]:
     return service.get_deliverable(run_id)
 
 
+@router.get("/runs/{run_id}/changes")
+def get_changes(run_id: str) -> dict[str, Any]:
+    """What this run changed, and which arriving document caused each change."""
+    try:
+        return service.get_changes(run_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"no run {run_id}") from None
+
+
 @router.get("/runs/{run_id}/cost")
 def get_cost(run_id: str) -> dict[str, Any]:
     try:
