@@ -18,6 +18,7 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.types import Command
 from psycopg_pool import ConnectionPool
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from ledger.config import get_settings
 from ledger.db import session_scope
@@ -80,16 +81,28 @@ def reset_checkpointer() -> None:
 
 
 def ensure_corpus(name: str) -> UUID:
+    """Get or create a corpus by name, safely under concurrency.
+
+    Insert-if-absent then read back, rather than check-then-insert. Two runs starting
+    together on the same corpus both saw it as absent, both inserted, and one died on
+    `corpus_name_key` — the same race as document ingestion, in the very first thing a
+    run does. Found by the behavior-9 test, which is the only thing that exercises two
+    runs starting at once.
+    """
     with session_scope() as session:
-        existing = session.execute(
-            select(Corpus).where(Corpus.name == name)
+        inserted = session.execute(
+            pg_insert(Corpus)
+            .values(name=name)
+            .on_conflict_do_nothing(index_elements=["name"])
+            .returning(Corpus.id)
         ).scalar_one_or_none()
-        if existing is not None:
-            return existing.id
-        corpus = Corpus(name=name)
-        session.add(corpus)
-        session.flush()
-        return corpus.id
+
+        if inserted is not None:
+            return inserted
+
+        return session.execute(
+            select(Corpus.id).where(Corpus.name == name)
+        ).scalar_one()
 
 
 def start_run(

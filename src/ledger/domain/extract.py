@@ -14,10 +14,14 @@ text is there or the fact does not exist.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 
 from ledger.domain.ingest import RawChunk
+from ledger.logging_config import get_logger, log
 from ledger.metering import MeteredClient
+
+logger = get_logger(__name__)
 
 PROMPT_VERSION = "extract-v1"
 
@@ -89,6 +93,48 @@ def _chunk_for_offset(chunks: list[RawChunk], offset: int) -> int | None:
         if chunk.char_start <= offset < chunk.char_end:
             return chunk.ordinal
     return None
+
+
+def _locate(
+    quote: str,
+    chunks: list[RawChunk],
+    document_text: str,
+    span_end: int,
+) -> tuple[tuple[int, int] | None, int | None]:
+    """Find a quote and return both its span and the chunk that actually holds it.
+
+    Resolves against **each chunk directly**, in order, before falling back to the
+    reassembled document. That ordering matters more than it looks.
+
+    Deriving the chunk from an offset into the reassembled text was wrong, and wrong
+    silently: chunk offsets come from a regex scan of the source, and any drift in that
+    scan places text at the wrong position in the buffer, so a quote resolves to an
+    offset belonging to a different paragraph. The citation still *looks* valid — it
+    has a document, a span and a chunk — and it points somewhere the value does not
+    appear.
+
+    Caught by Stage C verification on a clean offline run: a fact whose value came from
+    the annual-fees line was cited to the hourly-rate paragraph. Nothing else in the
+    system would have noticed, which is precisely why that check exists.
+
+    Matching a chunk directly means the reported chunk is the one whose own text
+    contains the quote, by construction. The whole-document fallback stays for quotes
+    that legitimately span a chunk boundary.
+    """
+    for chunk in chunks:
+        span = resolve_citation(quote, chunk)
+        if span is not None:
+            return span, chunk.ordinal
+
+    whole = RawChunk(ordinal=0, text=document_text, char_start=0, char_end=span_end)
+    span = resolve_citation(quote, whole)
+    if span is None:
+        return None, None
+
+    # Spans a boundary. Attribute it to the chunk its start falls in; None is a legal
+    # answer, and verification reports such a citation as unverifiable rather than
+    # passing it silently.
+    return span, _chunk_for_offset(chunks, span[0])
 
 
 @dataclass(frozen=True)
@@ -200,10 +246,101 @@ def resolve_citation(quote: str, chunk: RawChunk) -> tuple[int, int] | None:
     return None
 
 
+class ExtractionFailed(ValueError):
+    """Extraction could not produce usable output after every retry.
+
+    Distinct from a generic error so the caller can skip the document and emit a
+    finding rather than aborting the run. One unreadable document must not take down a
+    corpus of eleven — but it must not vanish quietly either.
+    """
+
+
+def _repair_prompt(document_text: str, document_name: str, problem: str) -> str:
+    """A second attempt that says what went wrong the first time.
+
+    Repeating the identical prompt is close to useless: a model that produced malformed
+    output once will usually do it again. Naming the failure is what gives the retry a
+    reason to succeed.
+    """
+    return (
+        f"Your previous response could not be used: {problem}\n"
+        f"Return ONLY valid JSON matching the schema. No prose, no code fences.\n\n"
+        + build_prompt(document_text, document_name)
+    )
+
+
+def _extract_with_repair(
+    document_text: str,
+    document_name: str,
+    client: MeteredClient,
+    max_retries: int,
+) -> dict:
+    """Call the model, retrying with a repair prompt on unusable output.
+
+    This is a real decision point in the graph, not error handling for its own sake:
+    the alternate branch is "give up on this document, report it, and keep going",
+    which is a different outcome from either success or a crashed run.
+    """
+    problem: str | None = None
+
+    for attempt in range(max_retries + 1):
+        prompt = (
+            build_prompt(document_text, document_name)
+            if problem is None
+            else _repair_prompt(document_text, document_name, problem)
+        )
+
+        try:
+            completion = client.generate(prompt, stage="extract", schema=EXTRACTION_SCHEMA)
+        except Exception as exc:
+            problem = f"the request failed ({type(exc).__name__})"
+            if attempt == max_retries:
+                raise ExtractionFailed(
+                    f"{document_name}: extraction failed after {max_retries + 1} "
+                    f"attempts — {problem}"
+                ) from exc
+            continue
+
+        try:
+            payload = json.loads(completion.text)
+        except json.JSONDecodeError as exc:
+            problem = f"the response was not valid JSON ({exc})"
+        else:
+            if not isinstance(payload, dict) or "facts" not in payload:
+                problem = "the response was JSON but had no 'facts' array"
+            else:
+                if attempt:
+                    log(
+                        logger,
+                        logging.INFO,
+                        "extraction succeeded after repair",
+                        document=document_name,
+                        attempt=attempt + 1,
+                    )
+                return payload
+
+        log(
+            logger,
+            logging.WARNING,
+            "extraction output unusable, retrying with a repair prompt",
+            document=document_name,
+            attempt=attempt + 1,
+            of=max_retries + 1,
+            problem=problem,
+        )
+
+    raise ExtractionFailed(
+        f"{document_name}: extraction produced unusable output after "
+        f"{max_retries + 1} attempts — {problem}"
+    )
+
+
 def extract_from_document(
     chunks: list[RawChunk],
     document_name: str,
     client: MeteredClient,
+    *,
+    max_retries: int = 2,
 ) -> ExtractionResult:
     """Extract from a whole document in one call, resolving each quote to its chunk.
 
@@ -225,11 +362,16 @@ def extract_from_document(
     if not chunks:
         return ExtractionResult(facts=[], rejections=[], instruction_like_spans=[])
 
-    # Reconstruct the document as the chunks describe it, preserving offsets. Built
-    # from char_start rather than by joining, so the text we search matches the
-    # offsets we will report even if chunking left gaps.
+    # Reconstruct the document at its original offsets.
+    #
+    # Gaps between chunks are filled with newlines, not spaces. Filling with spaces
+    # flattens every paragraph break in the document into whitespace, which has two
+    # consequences and both are bad: the model sees a wall of text with no structure,
+    # and a "line" of that text can span several paragraphs — so a quote drawn from it
+    # crosses chunk boundaries, resolves to whichever chunk it *starts* in, and cites a
+    # passage that does not contain the value. Stage C caught exactly that.
     span_end = max(c.char_end for c in chunks)
-    buffer = [" "] * span_end
+    buffer = ["\n"] * span_end
     for chunk in chunks:
         for i, character in enumerate(chunk.text):
             position = chunk.char_start + i
@@ -237,15 +379,7 @@ def extract_from_document(
                 buffer[position] = character
     document_text = "".join(buffer)
 
-    whole = RawChunk(ordinal=0, text=document_text, char_start=0, char_end=span_end)
-
-    prompt = build_prompt(document_text, document_name)
-    completion = client.generate(prompt, stage="extract", schema=EXTRACTION_SCHEMA)
-
-    try:
-        payload = json.loads(completion.text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"extraction returned non-JSON: {exc}") from exc
+    payload = _extract_with_repair(document_text, document_name, client, max_retries)
 
     facts: list[ExtractedFact] = []
     rejections: list[Rejection] = []
@@ -263,7 +397,7 @@ def extract_from_document(
             )
             continue
 
-        span = resolve_citation(quote, whole)
+        span, ordinal = _locate(quote, chunks, document_text, span_end)
         if span is None:
             rejections.append(
                 Rejection(
@@ -283,10 +417,7 @@ def extract_from_document(
                 quote=quote,
                 char_start=span[0],
                 char_end=span[1],
-                # Which chunk actually contains this span. Carried so a citation still
-                # resolves to a stored chunk row, not merely to an offset in text that
-                # was reassembled in memory and then discarded.
-                chunk_ordinal=_chunk_for_offset(chunks, span[0]),
+                chunk_ordinal=ordinal,
                 confidence=float(item.get("confidence", 0.0)),
                 unit=item.get("unit") or None,
                 effective_date=item.get("effective_date") or None,

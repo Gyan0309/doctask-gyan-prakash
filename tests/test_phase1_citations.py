@@ -116,6 +116,51 @@ class TestExtractionDiscardsUncitedFacts:
         # without trace is indistinguishable from one the document never contained.
         assert "does not appear" in result.rejections[0].reason
 
+    def test_a_citation_resolves_to_the_chunk_that_actually_contains_it(self) -> None:
+        """The chunk reported must be the one whose own text holds the quote.
+
+        Deriving it from an offset into a reassembled document was wrong silently: any
+        drift in the offset scan attributes a quote to a neighbouring paragraph, and
+        the citation still looks valid — document, span, chunk all present — while
+        pointing where the value does not appear. Caught only by Stage C verification,
+        on a clean run, after everything else reported success.
+        """
+        first = RawChunk(
+            ordinal=0,
+            text="The hourly rate is $180 per hour.",
+            char_start=0,
+            char_end=33,
+        )
+        second = RawChunk(
+            ordinal=1,
+            text="Estimated annual fees are $600,000.",
+            char_start=35,
+            char_end=70,
+        )
+        _, client = self._client(
+            {
+                "facts": [
+                    {
+                        "predicate": "annual_fees",
+                        "subject": "ACME",
+                        "value_raw": "$600,000",
+                        "quote": "Estimated annual fees are $600,000.",
+                        "confidence": 0.9,
+                    }
+                ],
+                "instruction_like_spans": [],
+            }
+        )
+        result = extract_from_document([first, second], "msa.md", client)
+
+        assert len(result.facts) == 1
+        fact = result.facts[0]
+        assert fact.chunk_ordinal == 1, (
+            "the citation must name the chunk containing the quote, not a neighbour"
+        )
+        # And the span must fall inside that chunk's real range.
+        assert second.char_start <= fact.char_start < second.char_end
+
     def test_a_term_split_across_chunks_is_still_extractable(self) -> None:
         """The reason extraction is per-document rather than per-chunk. Shown only one
         side of a paragraph break, a model cannot know what it is missing — so the

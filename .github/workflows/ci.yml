@@ -1,5 +1,10 @@
-# CI holds no secrets. There is no `secrets.` reference anywhere in this file, and
-# there is no repository secret configured for it to read.
+# CI holds no credentials of any kind.
+#
+# This workflow never reads from the GitHub secrets context, and the repository has
+# none configured. Verify it yourself:
+#
+#     grep -c 'secrets\.' .github/workflows/ci.yml     # → 0
+#     gh api repos/OWNER/REPO/actions/secrets          # → total_count 0
 #
 # That is a design claim, not a convenience: the suite runs against LLM_PROVIDER=fake,
 # so a fork, a clone, or a reviewer with no credentials gets the same green run we do.
@@ -73,7 +78,20 @@ jobs:
         run: |
           alembic check
 
-      - name: Test
+      - name: Unit tests run with no database at all
+        # Proves the claim in tests/README.md rather than asserting it. This once
+        # silently became a no-op: an autouse fixture called pytest.skip(), which
+        # raises a BaseException subclass, so the entire suite skipped and reported
+        # success. A run that skips everything and a run that passes everything look
+        # identical in a summary line — so this step fails if too few tests execute.
+        env:
+          DATABASE_URL: postgresql+psycopg://nobody:nobody@localhost:1/none
+        run: |
+          pytest -m "not integration" -q --no-header | tee /tmp/unit.txt
+          grep -qE "[0-9]{2,} passed" /tmp/unit.txt || {
+            echo "expected dozens of unit tests to run without a database"; exit 1; }
+
+      - name: Full suite
         run: pytest -v
 
       - name: Confirm no key was needed

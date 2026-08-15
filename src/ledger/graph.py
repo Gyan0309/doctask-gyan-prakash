@@ -24,6 +24,8 @@ from uuid import UUID
 from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from ledger.config import get_settings
 from ledger.db import session_scope
@@ -31,7 +33,7 @@ from ledger.domain.adjudicate import adjudicate
 from ledger.domain.classify import classify_document
 from ledger.domain.compose import SectionPlan, apply_plan, plan_recomposition
 from ledger.domain.conflicts import ConflictCandidate, detect
-from ledger.domain.extract import extract_from_document
+from ledger.domain.extract import ExtractionFailed, extract_from_document
 from ledger.domain.ingest import RawChunk, UnsupportedFormat, load_document
 from ledger.domain.normalize import normalize, normalize_date
 from ledger.domain.reconcile import FactView, reconcile
@@ -167,17 +169,34 @@ def ingest(state: RunState) -> dict[str, Any]:
                 )
                 continue
 
-            existing = (
-                session.query(Document)
-                .filter(
-                    Document.corpus_id == UUID(state["corpus_id"]),
-                    Document.sha256 == loaded.sha256,
+            # Insert-if-absent in one statement, then read back.
+            #
+            # A check-then-insert races: two concurrent runs over the same corpus both
+            # see the document as absent, both insert, and one dies on
+            # uq_document_corpus_sha256. That is not a rare interleaving — it is what
+            # happens every time two runs start together, which behavior 9 requires to
+            # work. Found by the concurrency test, not by review.
+            inserted = session.execute(
+                pg_insert(Document)
+                .values(
+                    corpus_id=UUID(state["corpus_id"]),
+                    uri=loaded.uri,
+                    sha256=loaded.sha256,
+                    mime=loaded.mime,
                 )
-                .one_or_none()
-            )
-            if existing is not None:
-                # Identical content already ingested. Not an error — re-dropping a
-                # file is a normal thing for a human to do, and it must be a no-op.
+                .on_conflict_do_nothing(index_elements=["corpus_id", "sha256"])
+                .returning(Document.id)
+            ).scalar_one_or_none()
+
+            if inserted is None:
+                # The other run won, or this file was ingested earlier. Either way the
+                # document exists and re-dropping a file is a normal no-op.
+                existing_id = session.execute(
+                    select(Document.id).where(
+                        Document.corpus_id == UUID(state["corpus_id"]),
+                        Document.sha256 == loaded.sha256,
+                    )
+                ).scalar_one()
                 log(
                     logger,
                     logging.INFO,
@@ -185,16 +204,10 @@ def ingest(state: RunState) -> dict[str, Any]:
                     document=path.name,
                     sha256=loaded.sha256[:12],
                 )
-                document_ids.append(str(existing.id))
+                document_ids.append(str(existing_id))
                 continue
 
-            document = Document(
-                corpus_id=UUID(state["corpus_id"]),
-                uri=loaded.uri,
-                sha256=loaded.sha256,
-                mime=loaded.mime,
-            )
-            session.add(document)
+            document = session.get(Document, inserted)
             session.flush()
 
             for raw in loaded.chunks:
@@ -353,6 +366,7 @@ def escalate(state: RunState) -> dict[str, Any]:
 @node("extract")
 def extract(state: RunState) -> dict[str, Any]:
     """Extract typed facts, keeping only those with resolvable citations."""
+    settings = get_settings()
     fact_ids: list[str] = []
     findings: list[dict[str, Any]] = []
 
@@ -411,7 +425,33 @@ def extract(state: RunState) -> dict[str, Any]:
 
             # One call per document, not per chunk. A term stated across a paragraph
             # break is invisible to a model shown only one side of it.
-            result = extract_from_document(raw_chunks, name, client)
+            try:
+                result = extract_from_document(
+                    raw_chunks, name, client, max_retries=settings.extract_max_retries
+                )
+            except ExtractionFailed as exc:
+                # Decision point 2's alternate branch: give up on this document,
+                # report it, and keep going. One document the model cannot parse must
+                # not take down a corpus — and must not disappear silently either.
+                log(
+                    logger,
+                    logging.ERROR,
+                    "extraction gave up on a document; run continues",
+                    document=name,
+                    detail=str(exc)[:200],
+                )
+                findings.append(
+                    {
+                        "severity": "high",
+                        "target_kind": "document",
+                        "explanation": (
+                            f"{name} was skipped: extraction could not produce usable "
+                            f"output after {settings.extract_max_retries + 1} attempts. "
+                            f"No facts from this document are in the register."
+                        ),
+                    }
+                )
+                continue
 
             for fact in result.facts:
                 # Normalize here, deterministically. `value_raw` keeps what the

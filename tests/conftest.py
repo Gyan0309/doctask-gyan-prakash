@@ -17,6 +17,11 @@ from sqlalchemy.engine import Engine
 # which reads as "my credentials are wrong" rather than "I reached the wrong server".
 DEFAULT_TEST_DB = "postgresql+psycopg://ledger:ledger@localhost:55432/ledger"
 
+# Bound the wait when nothing is listening. Without this the probe can hang instead of
+# failing, and a suite that hangs is worse than one that fails — the developer has no
+# idea whether it is working or stuck, and CI eventually kills it with no useful output.
+CONNECT_ARGS = {"connect_timeout": 3}
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _offline_by_default() -> None:
@@ -40,7 +45,7 @@ def database_url() -> str:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _clear_model_cache(request) -> None:
+def _clear_model_cache(database_url: str) -> None:
     """Start each test session with an empty model cache.
 
     The cache is keyed on (stage, prompt, model, prompt_version) — deliberately, so
@@ -51,13 +56,22 @@ def _clear_model_cache(request) -> None:
 
     Learned the hard way: a fix to the injection stub appeared to do nothing for
     several runs because every call was a cache hit from before the change.
+
+    This connects directly rather than requesting the `engine` fixture. `engine` calls
+    pytest.skip() when no database is present, and Skipped derives from BaseException —
+    so an autouse session fixture that triggers it skips the **entire suite**, unit
+    tests included. That silently turned `pytest -m "not integration"` into a no-op
+    that reported success.
     """
     try:
-        eng = request.getfixturevalue("engine")
+        eng = create_engine(database_url, connect_args=CONNECT_ARGS)
+        with eng.begin() as conn:
+            conn.execute(text("TRUNCATE TABLE model_cache"))
+        eng.dispose()
     except Exception:
+        # No database, or no schema yet. Integration tests will skip individually with
+        # a usable message; the unit tests neither need nor care.
         return
-    with eng.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE model_cache"))
 
 
 @pytest.fixture(scope="session")
@@ -68,7 +82,7 @@ def engine(database_url: str) -> Engine:
     "these need a database, start compose" rather than a wall of connection errors
     that buries the unit tests that did run.
     """
-    eng = create_engine(database_url, pool_pre_ping=True)
+    eng = create_engine(database_url, pool_pre_ping=True, connect_args=CONNECT_ARGS)
     try:
         with eng.connect() as conn:
             conn.execute(text("SELECT 1"))

@@ -48,12 +48,21 @@ Override with `DB_HOST_PORT` if 55432 is also taken.
 ## Tests
 
 ```bash
-pytest
+pytest                      # 180 tests
+pytest -m "not integration" # 123 of them need no database either
 ```
 
 **Every test runs with no API key, no network, and no recorded fixtures.** CI holds no
-secrets at all — there is no `secrets.` reference in the workflow and no repository
-secret for it to read. A fork gets the same green run we do.
+credentials at all — verify it rather than believe it:
+
+```bash
+grep -c 'secrets\.' .github/workflows/ci.yml   # → 0
+gh api repos/OWNER/REPO/actions/secrets        # → total_count 0
+```
+
+A fork, a clone, or a reviewer with no credentials gets the same green run we do. See
+[tests/README.md](tests/README.md) for why there are no cassettes, and for the list of
+bugs these tests actually caught.
 
 That is a deliberate design constraint rather than a convenience. Tests that assert on
 replayed model output mostly prove the recording still parses. These assert on what
