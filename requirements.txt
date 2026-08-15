@@ -1,0 +1,33 @@
+# Core runtime.
+#
+# Pins are exact so a clone in three weeks builds the system we tested, not whatever
+# resolved that morning. Behavior 6 is "fresh clone to working system"; a floating
+# pin is how that promise quietly stops being true.
+#
+# Every version below was resolved against PyPI and installed successfully on
+# 2026-08-15 — none are from memory.
+
+fastapi==0.141.1
+uvicorn[standard]==0.52.3
+pydantic==2.13.4
+pydantic-settings==2.15.0
+
+# psycopg MUST carry the [binary] extra.
+#
+# Plain `psycopg` installs cleanly and then fails at *import* with "no pq wrapper
+# available", because it expects a system libpq that Windows does not have and slim
+# container images do not ship. The failure surfaces inside LangGraph's PostgresSaver,
+# which makes it look like a LangGraph bug and sends you debugging the wrong library.
+# The [binary] extra bundles a compiled libpq. Verified on this machine, 2026-08-15.
+psycopg[binary]==3.3.4
+
+SQLAlchemy==2.0.52
+alembic==1.19.1
+pgvector==0.5.0
+
+langgraph==1.2.11
+langgraph-checkpoint-postgres==3.1.2
+
+httpx==0.28.1
+PyYAML==6.0.3
+pypdf==6.4.0

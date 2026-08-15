@@ -1,0 +1,66 @@
+# The one documented command: `docker compose up`
+#
+# A fresh clone comes up with no .env and no API key at all. The API starts, the
+# schema migrates, and GET /health reports exactly which dependency is unconfigured.
+# Adding a key upgrades it from "running and honest" to "running and useful" — but
+# the clone-to-running path never requires one.
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger
+    ports:
+      # Host port 55432, not 5432, and deliberately so.
+      #
+      # Anyone who already runs Postgres locally — which is most people who would
+      # review this — has 5432 occupied. The failure is nasty rather than obvious:
+      # Docker still reports the port as bound and the container as healthy, but
+      # localhost connections silently reach the *other* Postgres and fail auth
+      # against credentials that look correct. Found exactly that way on this
+      # machine, 2026-08-15, against a native postgresql-x64-17 service.
+      #
+      # Inside the compose network nothing changes; the API still uses db:5432.
+      - "${DB_HOST_PORT:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Without this the API races the database on a cold start, fails its first
+      # migration, and restarts — which looks like a broken build to anyone cloning
+      # for the first time.
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://ledger:ledger@db:5432/ledger
+      WATCH_DIR: /data/inbox
+      # Defaults to the offline provider so a keyless clone still boots green.
+      # Set LLM_PROVIDER=gemini in .env to use real models.
+      LLM_PROVIDER: ${LLM_PROVIDER:-fake}
+    env_file:
+      # Optional by design: absent .env must not break `docker compose up`.
+      - path: .env
+        required: false
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./inbox:/data/inbox
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import httpx,sys; sys.exit(0 if httpx.get('http://localhost:8000/health').status_code==200 else 1)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  pgdata:

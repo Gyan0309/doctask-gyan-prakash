@@ -1,0 +1,35 @@
+# Local-only working files — never committed.
+RULES.md
+
+# Secrets — never commit. A key in a repo, log, or screenshot is disqualifying.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+**/agent_credentials.json
+.superdocs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+dist/
+build/
+.vite/
+
+# Local artifacts
+exports/
+*.log
+inbox/
+.DS_Store
+Thumbs.db

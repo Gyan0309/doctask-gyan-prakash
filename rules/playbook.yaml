@@ -1,0 +1,43 @@
+# The contract playbook.
+#
+# Adding a rule is a data change. Adding a rule *kind* is a code change — and four
+# kinds cover this playbook, which is the line between "configuration over code" and
+# a config file that is really just code in disguise.
+
+ruleset_id: standard-vendor-playbook-v1
+
+rules:
+  - code: LIAB-01
+    kind: numeric_bound
+    predicate: liability_cap
+    description: Liability cap must not exceed 2x annual fees
+    config: { expr: "2 * annual_fees" }
+    severity: high
+
+  - code: PAY-01
+    kind: numeric_max
+    predicate: payment_terms_days
+    description: Payment terms must be net-30 or better
+    config: { max: 30 }
+    severity: medium
+
+  - code: RENEW-01
+    kind: numeric_max
+    predicate: auto_renew_months
+    description: No auto-renewal beyond 12 months without review
+    config: { max: 12 }
+    severity: medium
+
+  - code: NOTICE-01
+    kind: numeric_min
+    predicate: termination_notice_days
+    description: Termination notice period must be at least 30 days
+    config: { min: 30 }
+    severity: medium
+
+  - code: LAW-01
+    kind: presence_required
+    predicate: governing_law
+    description: Governing law must be named explicitly
+    config: {}
+    severity: low

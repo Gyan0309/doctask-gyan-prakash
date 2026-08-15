@@ -1,0 +1,116 @@
+# CI holds no secrets. There is no `secrets.` reference anywhere in this file, and
+# there is no repository secret configured for it to read.
+#
+# That is a design claim, not a convenience: the suite runs against LLM_PROVIDER=fake,
+# so a fork, a clone, or a reviewer with no credentials gets the same green run we do.
+# A suite that needs a key to pass is a suite most reviewers will never see pass.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      db:
+        # Same image as docker-compose.yml. If CI used plain postgres, the pgvector
+        # tests would pass locally and fail here — or worse, be quietly skipped.
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: ledger
+          POSTGRES_PASSWORD: ledger
+          POSTGRES_DB: ledger
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ledger -d ledger"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgresql+psycopg://ledger:ledger@localhost:5432/ledger
+      LLM_PROVIDER: fake
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install --no-deps -e .
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Apply migrations
+        run: alembic upgrade head
+
+      - name: Migrations are complete
+        # Autogenerate against a fully migrated database must produce an empty diff.
+        # Without this, a model edit that never got a migration passes CI locally and
+        # breaks the next clean clone — the exact failure behavior 6 forbids.
+        run: |
+          alembic check
+
+      - name: Test
+        run: pytest -v
+
+      - name: Confirm no key was needed
+        # Belt and braces: prove the run really had no credentials in scope.
+        run: |
+          test -z "${GEMINI_API_KEY:-}" || (echo "a key leaked into CI env" && exit 1)
+          test -z "${SUPERDOCS_API_KEY:-}" || (echo "a key leaked into CI env" && exit 1)
+          echo "CI completed with no model or SuperDocs credentials present."
+
+  compose:
+    # Behavior 6, tested rather than asserted: a clean checkout with no .env must
+    # reach a healthy API through one documented command.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: docker compose up, from a clone with no .env
+        run: |
+          test ! -f .env
+          docker compose up -d --build
+
+      - name: Wait for the API to report healthy
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/health > /tmp/health.json; then
+              cat /tmp/health.json
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "API never became healthy"
+          docker compose logs
+          exit 1
+
+      - name: Schema really is at head inside the container
+        run: docker compose exec -T api alembic current | tee /dev/stderr | grep -q "(head)"
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
