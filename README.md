@@ -178,12 +178,26 @@ network.
 
 ## Status
 
-**Phase 2 complete.** Documents are classified (with a real escalation branch for low
+**Phase 3 complete.** Documents are classified (with a real escalation branch for low
 confidence), facts extracted with verified citations, values normalized, competing
-values reconciled to the one that governs, and the register composed from only the
-sections whose dependencies changed.
+values reconciled to the one that governs, contradictions detected deterministically
+and adjudicated by a model, and the register composed from only the sections whose
+dependencies changed.
 
-Measured on a real model over 7 documents, not asserted:
+### What it finds
+
+Run against an eight-document corpus spanning two vendors, an amendment chain and two
+invoices, it reports three conflicts and nothing else:
+
+| Severity | Finding |
+|---|---|
+| high | Invoice bills $180/hr when Amendment No. 1 set $195 effective 2025-07-01 |
+| medium | Invoice states net 45 when the amendment set net 30 |
+| high | Invoice total $20,500 ≠ 100 hrs × $195 = $19,500 — a $1,000 overcharge |
+
+Each is arithmetic, not opinion, and each cites the documents it came from.
+
+### What it costs
 
 | | Run 1 | Run 2, identical input |
 |---|---|---|
@@ -193,12 +207,11 @@ Measured on a real model over 7 documents, not asserted:
 | Carried forward | 0 | **18** |
 | Content hashes | — | **byte-identical** |
 
-The register resolves a real amendment chain: the hourly rate reports **$195 effective
-2025-07-01**, sourced to the amendment, with the superseded $180 retained as evidence
-rather than deleted. An invoice billing the old rate appears as an *observation*, never
-as an agreed term — what was billed does not get to define what was agreed.
+And on a corpus with nothing wrong with it, the adjudication stage does not run at all
+— recorded as `skipped`, costing zero model calls. A stage that legitimately did not
+run and a stage that was never wired up must not look alike, so the skip is written
+down rather than omitted.
 
-Not yet built: conflict detection and adjudication, the rules engine, the fresh-eyes
-verifier, and the folder watcher. Those stages are absent rather than stubbed — a
-capability may be honestly missing, never present and broken. This README gains
-sections as the stages that back them land.
+Not yet built: the rules engine, the fresh-eyes verifier, and the folder watcher. Those
+stages are absent rather than stubbed — a capability may be honestly missing, never
+present and broken. This README gains sections as the stages that back them land.

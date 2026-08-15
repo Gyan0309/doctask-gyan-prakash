@@ -26,15 +26,17 @@ from langgraph.types import interrupt
 
 from ledger.config import get_settings
 from ledger.db import session_scope
+from ledger.domain.adjudicate import adjudicate
 from ledger.domain.classify import classify_document
 from ledger.domain.compose import SectionPlan, apply_plan, plan_recomposition
+from ledger.domain.conflicts import ConflictCandidate, detect
 from ledger.domain.extract import extract_from_document
 from ledger.domain.ingest import RawChunk, UnsupportedFormat, load_document
 from ledger.domain.normalize import normalize, normalize_date
 from ledger.domain.reconcile import FactView, reconcile
 from ledger.logging_config import get_logger, log, run_context, stage_context
 from ledger.metering import MeteredClient
-from ledger.models import Chunk, Decision, Document, Fact, Finding, Run
+from ledger.models import Chunk, Conflict, Decision, Document, Fact, Finding, Run
 from ledger.providers import build_provider
 
 
@@ -53,6 +55,9 @@ class RunState(TypedDict, total=False):
     # Documents whose classification was too uncertain to act on. Non-empty routes the
     # graph to the escalation node instead of straight to extraction.
     escalations: Annotated[list[dict[str, Any]], _merge]
+    # Deterministically detected discrepancies awaiting judgement. Empty means the
+    # corpus is clean and adjudication is skipped rather than asked to confirm it.
+    conflict_candidates: list[dict[str, Any]]
     plan_summary: dict[str, int]
     decisions: dict[str, str]
     status: str
@@ -238,6 +243,7 @@ def classify(state: RunState) -> dict[str, Any]:
             document.kind = result.kind
             document.kind_confidence = result.confidence
             document.vendor = result.vendor or None
+            document.document_date = normalize_date(result.document_date)
 
             if result.confidence < settings.classify_confidence_threshold:
                 log(
@@ -486,58 +492,206 @@ def extract(state: RunState) -> dict[str, Any]:
     return {"fact_ids": fact_ids, "findings": findings}
 
 
+def _fact_views(session, corpus_id: str, fact_ids: list[str]) -> list[FactView]:
+    """Build the reconciliation/conflict view over a run's facts.
+
+    Shared by detect_conflicts and compose so the two can never disagree about which
+    document a fact belongs to or which vendor it concerns — a divergence there would
+    mean the register reports one thing and the conflict report another.
+    """
+    if not fact_ids:
+        return []
+
+    facts = (
+        session.query(Fact).filter(Fact.id.in_([UUID(f) for f in fact_ids])).all()
+    )
+    documents = {
+        d.id: d
+        for d in session.query(Document).filter(Document.corpus_id == UUID(corpus_id)).all()
+    }
+
+    views = []
+    for f in facts:
+        document = documents.get(f.document_id)
+        kind = (document.kind if document else None) or "unknown"
+        views.append(
+            FactView(
+                fact_id=f.id,
+                predicate=f.predicate,
+                subject=(document.vendor if document and document.vendor else f.subject),
+                value_raw=f.value_raw,
+                value_norm=None,
+                unit=f.unit,
+                # A fact's own date wins; otherwise it inherits the document's.
+                # Invoices state their date once in the header and never repeat it per
+                # line, so without this fallback every invoice fact is undated and the
+                # temporal comparator skips it silently.
+                effective_date=(
+                    f.effective_date
+                    or (document.document_date if document else None)
+                ),
+                document_id=f.document_id,
+                document_kind=kind,
+                scope=str(f.document_id) if kind == "sow" else None,
+            )
+        )
+    return views
+
+
+@node("detect_conflicts")
+def detect_conflicts(state: RunState) -> dict[str, Any]:
+    """Find discrepancies deterministically. No model runs in this node."""
+    with session_scope() as session:
+        views = _fact_views(session, state["corpus_id"], state.get("fact_ids", []))
+        candidates = detect(views)
+
+        log(
+            logger,
+            logging.INFO,
+            "conflict candidates generated deterministically",
+            candidates=len(candidates),
+            by_kind={
+                kind: sum(1 for c in candidates if c.kind == kind)
+                for kind in {c.kind for c in candidates}
+            },
+        )
+
+        client = _client(session, state["run_id"])
+        client.record_stage("detect_conflicts")
+
+        if not candidates:
+            # Record the skip explicitly. Omitting the row would make "adjudication
+            # correctly did not run" indistinguishable from "adjudication was never
+            # wired up" — and the second is a bug that would ship unnoticed.
+            client.record_stage("adjudicate", skipped=True)
+
+        # Serialized into state rather than passed as objects: LangGraph checkpoints
+        # after every node, and a FactView would not survive the round trip.
+        payload = [
+            {
+                "kind": c.kind,
+                "subject": c.subject,
+                "predicate": c.predicate,
+                "detail": c.detail,
+                "a_fact_id": str(c.a.fact_id),
+                "b_fact_id": str(c.b.fact_id),
+                "a_value": c.a.value_raw,
+                "b_value": c.b.value_raw,
+                "a_kind": c.a.document_kind,
+                "b_kind": c.b.document_kind,
+                "a_date": c.a.effective_date.isoformat() if c.a.effective_date else None,
+                "b_date": c.b.effective_date.isoformat() if c.b.effective_date else None,
+            }
+            for c in candidates
+        ]
+
+    return {"conflict_candidates": payload}
+
+
+def route_after_detection(state: RunState) -> str:
+    """Decision point 3: a clean corpus skips adjudication entirely.
+
+    This is the honest-clean path. There is nothing to judge, so no model is called
+    and no cost is incurred — and the skip is observable, because `stage_metric`
+    records the stage as skipped rather than omitting it. A stage that legitimately
+    did not run and a stage that was never wired up must not look alike.
+    """
+    return "adjudicate" if state.get("conflict_candidates") else "compose"
+
+
+@node("adjudicate")
+def adjudicate_conflicts(state: RunState) -> dict[str, Any]:
+    """Ask the model which candidates are real contradictions, and how bad.
+
+    The model can downgrade or explain. It cannot invent: the candidate list is fixed
+    before this node runs, so recall is a property of the deterministic comparators
+    rather than of a prompt.
+    """
+    payload = state.get("conflict_candidates", [])
+    findings: list[dict[str, Any]] = []
+
+    with session_scope() as session:
+        views = {
+            str(v.fact_id): v
+            for v in _fact_views(session, state["corpus_id"], state.get("fact_ids", []))
+        }
+
+        candidates = [
+            ConflictCandidate(
+                kind=item["kind"],
+                subject=item["subject"],
+                predicate=item["predicate"],
+                a=views[item["a_fact_id"]],
+                b=views[item["b_fact_id"]],
+                detail=item["detail"],
+            )
+            for item in payload
+            if item["a_fact_id"] in views and item["b_fact_id"] in views
+        ]
+
+        client = _client(session, state["run_id"])
+        results = adjudicate(candidates, client)
+
+        real = 0
+        for result in results:
+            candidate = result.candidate
+
+            # Every candidate is persisted, including dismissed ones. I4 says never
+            # silently resolve a contradiction — and a dismissal the reviewer cannot
+            # see is exactly that, however well-reasoned it was.
+            session.add(
+                Conflict(
+                    kind=candidate.kind,
+                    severity=result.severity,
+                    status="open" if result.is_real_conflict else "dismissed",
+                    a_fact_id=candidate.a.fact_id,
+                    b_fact_id=candidate.b.fact_id,
+                    explanation=result.explanation,
+                    adjudicated=True,
+                    detected_in_run=UUID(state["run_id"]),
+                )
+            )
+
+            if result.is_real_conflict:
+                real += 1
+                findings.append(
+                    {
+                        "severity": result.severity,
+                        "target_kind": "conflict",
+                        "explanation": (
+                            f"{candidate.subject} — {candidate.predicate}: "
+                            f"{result.explanation}"
+                        ),
+                    }
+                )
+
+        client.record_stage("adjudicate")
+
+        log(
+            logger,
+            logging.INFO,
+            "adjudication complete",
+            candidates=len(candidates),
+            confirmed=real,
+            dismissed=len(results) - real,
+        )
+
+    return {"findings": findings}
+
+
 @node("compose")
 def compose(state: RunState) -> dict[str, Any]:
     """Build the register, re-deriving only sections whose dependencies changed."""
     with session_scope() as session:
-        facts = (
-            session.query(Fact)
-            .filter(Fact.id.in_([UUID(f) for f in state.get("fact_ids", [])]))
-            .all()
-            if state.get("fact_ids")
-            else []
-        )
-
-        # Reconcile before composing. Without this the register would list every
-        # value any document ever stated for a term, which is a pile of paper, not a
+        # Same view the conflict detector saw. Built by one helper rather than two
+        # copies, because a divergence here would mean the register reports one thing
+        # and the conflict report another about the same fact.
+        #
+        # Reconcile before composing: without it the register would list every value
+        # any document ever stated for a term, which is a pile of paper, not a
         # register. Reconciliation picks the one that governs and keeps the rest as
         # evidence.
-        documents = {
-            d.id: d
-            for d in session.query(Document)
-            .filter(Document.corpus_id == UUID(state["corpus_id"]))
-            .all()
-        }
-
-        views = []
-        for f in facts:
-            document = documents.get(f.document_id)
-            kind = (document.kind if document else None) or "unknown"
-
-            views.append(
-                FactView(
-                    fact_id=f.id,
-                    predicate=f.predicate,
-                    # Vendor comes from the document, not the fact. See the comment on
-                    # Document.vendor — per-fact subjects drift and fragment the
-                    # register, which stops amendments from superseding the terms they
-                    # amend.
-                    subject=(
-                        document.vendor if document and document.vendor else f.subject
-                    ),
-                    value_raw=f.value_raw,
-                    value_norm=None,
-                    unit=f.unit,
-                    effective_date=f.effective_date,
-                    document_id=f.document_id,
-                    document_kind=kind,
-                    # A Statement of Work binds its own engagement. Scoping by document
-                    # keeps a specialist rate from competing with the standard rate —
-                    # without it a $210 SOW rate appears to supersede the $195
-                    # agreement rate, manufacturing a contradiction that is not real.
-                    scope=str(f.document_id) if kind == "sow" else None,
-                )
-            )
+        views = _fact_views(session, state["corpus_id"], state.get("fact_ids", []))
 
         desired = []
         for resolution in reconcile(views):
@@ -682,6 +836,8 @@ def build_graph(checkpointer=None):
     builder.add_node("classify", classify)
     builder.add_node("escalate", escalate)
     builder.add_node("extract", extract)
+    builder.add_node("detect_conflicts", detect_conflicts)
+    builder.add_node("adjudicate", adjudicate_conflicts)
     builder.add_node("compose", compose)
     builder.add_node("gate", gate)
     builder.add_node("commit", commit)
@@ -698,7 +854,16 @@ def build_graph(checkpointer=None):
         {"escalate": "escalate", "extract": "extract"},
     )
     builder.add_edge("escalate", "extract")
-    builder.add_edge("extract", "compose")
+    builder.add_edge("extract", "detect_conflicts")
+
+    # Decision point 3: a clean corpus skips adjudication entirely rather than paying
+    # a model to confirm there is nothing to say.
+    builder.add_conditional_edges(
+        "detect_conflicts",
+        route_after_detection,
+        {"adjudicate": "adjudicate", "compose": "compose"},
+    )
+    builder.add_edge("adjudicate", "compose")
     builder.add_edge("compose", "gate")
     builder.add_edge("gate", "commit")
     builder.add_edge("commit", END)

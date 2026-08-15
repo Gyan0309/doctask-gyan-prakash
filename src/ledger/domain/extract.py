@@ -34,6 +34,10 @@ PREDICATES = [
     "annual_fees",
     "invoice_amount",
     "invoice_rate",
+    # Needed so the arithmetic comparator has components to multiply. Without it that
+    # comparator can never fire, and a check that cannot fire is a claimed capability
+    # that does not exist.
+    "invoice_hours",
 ]
 
 EXTRACTION_SCHEMA = {

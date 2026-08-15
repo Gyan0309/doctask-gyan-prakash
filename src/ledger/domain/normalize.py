@@ -31,6 +31,10 @@ MONEY_PREDICATES = {
     "invoice_rate",
 }
 
+# Dimensionless counts. Their own unit so they can never be compared against money or
+# durations by magnitude alone.
+QUANTITY_PREDICATES = {"invoice_hours"}
+
 # Predicates whose values are a count of days.
 DAY_PREDICATES = {"payment_terms_days", "termination_notice_days"}
 
@@ -165,6 +169,10 @@ def normalize(predicate: str, raw: str) -> NormalizedValue | None:
     if predicate in PERCENT_PREDICATES:
         value = normalize_percent(raw)
         return NormalizedValue(value, "percent") if value is not None else None
+
+    if predicate in QUANTITY_PREDICATES:
+        value = _bare_number(raw) or _first_match(raw, [rf"{_NUMBER}\s*hour"])
+        return NormalizedValue(value, "hours") if value is not None else None
 
     # Free-text predicates (governing_law). Case and spacing are normalized so
     # "State of Delaware" and "state of delaware" compare equal, but nothing else is

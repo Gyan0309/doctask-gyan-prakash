@@ -29,7 +29,10 @@ class Settings(BaseSettings):
 
     # --- model provider -----------------------------------------------------
     # "gemini" → real API calls. "fake" → deterministic stub, no key, no network.
-    llm_provider: str = "gemini"
+    #
+    # Defaults to "fake" so a fresh clone with no .env and no key comes up working
+    # rather than merely running. Set LLM_PROVIDER=gemini in .env for real models.
+    llm_provider: str = "fake"
 
     gemini_api_key: str | None = None
 

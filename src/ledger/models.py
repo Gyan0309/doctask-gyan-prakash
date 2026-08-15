@@ -95,6 +95,17 @@ class Document(Base):
     # made from fragments.
     vendor: Mapped[str | None] = mapped_column(String(200))
 
+    # The date this document takes effect, or is dated. Read once per document by the
+    # classifier, and used as the effective date for any fact that does not state one
+    # of its own.
+    #
+    # This is load-bearing rather than cosmetic. Invoices state their date in the
+    # header and then never repeat it per line item, so every extracted invoice fact
+    # arrived with a NULL effective date — which made the temporal comparator skip
+    # them entirely and rendered the central conflict of the domain undetectable. The
+    # arithmetic was right, the grouping was right, and the check silently never ran.
+    document_date: Mapped[date | None] = mapped_column(Date)
+
     ingested_at: Mapped[datetime] = _now()
 
     __table_args__ = (

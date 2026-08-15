@@ -44,9 +44,17 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://ledger:ledger@db:5432/ledger
       WATCH_DIR: /data/inbox
-      # Defaults to the offline provider so a keyless clone still boots green.
-      # Set LLM_PROVIDER=gemini in .env to use real models.
-      LLM_PROVIDER: ${LLM_PROVIDER:-fake}
+      # LLM_PROVIDER is deliberately NOT set here.
+      #
+      # Compose applies `environment:` *after* `env_file`, so listing it here would
+      # silently override whatever .env says — and worse, `${LLM_PROVIDER:-fake}`
+      # interpolates from the *host* shell, so an exported variable left over from
+      # running the test suite would quietly reconfigure the container. That cost real
+      # debugging time: a run against "Gemini" was answered entirely by the offline
+      # stub, and looked plausible enough that only the vendor names gave it away.
+      #
+      # The safe default now lives in config.py (LLM_PROVIDER=fake), so a keyless
+      # clone still boots green, and .env is authoritative when present.
     env_file:
       # Optional by design: absent .env must not break `docker compose up`.
       - path: .env

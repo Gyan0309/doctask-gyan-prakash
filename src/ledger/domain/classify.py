@@ -48,10 +48,11 @@ CLASSIFY_SCHEMA = {
     "properties": {
         "kind": {"type": "STRING", "enum": DOCUMENT_KINDS},
         "vendor": {"type": "STRING"},
+        "document_date": {"type": "STRING"},
         "confidence": {"type": "NUMBER"},
         "reasoning": {"type": "STRING"},
     },
-    "required": ["kind", "vendor", "confidence", "reasoning"],
+    "required": ["kind", "vendor", "document_date", "confidence", "reasoning"],
 }
 
 
@@ -61,6 +62,7 @@ class Classification:
     vendor: str
     confidence: float
     reasoning: str
+    document_date: str | None = None
 
     @property
     def precedence(self) -> int:
@@ -89,6 +91,10 @@ Document kinds:
 
 Rules:
 - `vendor` is the supplier or service provider, not the client.
+- `document_date` is the date this document takes effect, in YYYY-MM-DD form. For an
+  amendment use its stated effective date, not its signature date. For an invoice use
+  the invoice date. For an agreement use the effective date. Empty string if the
+  document states no date at all — do not infer one.
 - `confidence` is 0.0 to 1.0 and must reflect genuine certainty. A document that
   could plausibly be two kinds should score low. Low confidence is routed to a human,
   so an honest low score is useful and an inflated one is harmful.
@@ -116,6 +122,7 @@ def classify_document(text: str, filename: str, client: MeteredClient) -> Classi
             vendor="",
             confidence=0.0,
             reasoning="classifier returned unparseable output",
+            document_date=None,
         )
 
     kind = payload.get("kind", "unknown")
@@ -142,4 +149,5 @@ def classify_document(text: str, filename: str, client: MeteredClient) -> Classi
         # threshold forever, including ones set deliberately high.
         confidence=max(0.0, min(1.0, confidence)),
         reasoning=(payload.get("reasoning") or "").strip(),
+        document_date=(payload.get("document_date") or "").strip() or None,
     )
