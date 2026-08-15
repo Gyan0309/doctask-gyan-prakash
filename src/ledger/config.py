@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     # --- ingestion ----------------------------------------------------------
     watch_dir: Path = Path("/data/inbox")
 
+    # --- rules --------------------------------------------------------------
+    # The contract playbook. A new rule is an edit to this file, never to code.
+    rules_path: Path = Path("rules/playbook.yaml")
+
     # --- logging ------------------------------------------------------------
     log_level: str = "INFO"
     # "human" for aligned, readable console output; "json" for log aggregators.

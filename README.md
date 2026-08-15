@@ -178,24 +178,59 @@ network.
 
 ## Status
 
-**Phase 3 complete.** Documents are classified (with a real escalation branch for low
+**Phase 4 complete.** Documents are classified (with a real escalation branch for low
 confidence), facts extracted with verified citations, values normalized, competing
 values reconciled to the one that governs, contradictions detected deterministically
-and adjudicated by a model, and the register composed from only the sections whose
-dependencies changed.
+and adjudicated by a model, the register composed from only the sections whose
+dependencies changed, the contract playbook applied, and every claim verified against
+its sources before anything is committed.
 
 ### What it finds
 
 Run against an eight-document corpus spanning two vendors, an amendment chain and two
-invoices, it reports three conflicts and nothing else:
+invoices, it reports ten findings — three contradictions between documents and seven
+breaches of the contract playbook:
 
-| Severity | Finding |
-|---|---|
-| high | Invoice bills $180/hr when Amendment No. 1 set $195 effective 2025-07-01 |
-| medium | Invoice states net 45 when the amendment set net 30 |
-| high | Invoice total $20,500 ≠ 100 hrs × $195 = $19,500 — a $1,000 overcharge |
+| Severity | Source | Finding |
+|---|---|---|
+| high | conflict | Invoice bills $180/hr when Amendment No. 1 set $195 effective 2025-07-01 |
+| high | conflict | Invoice total $20,500 ≠ 100 hrs × $195 = $19,500 — a $1,000 overcharge |
+| high | LIAB-01 | Cobalt liability cap $5,000,000 exceeds 2 × annual fees = $620,000 |
+| high | LIAB-01 | Northwind liability cap $2,500,000 exceeds 2 × annual fees = $1,200,000 |
+| medium | conflict | Invoice payment terms deviate from the governing amendment |
+| medium | PAY-01 | Cobalt payment terms net 60 exceed net 30 |
+| medium | RENEW-01 | Cobalt auto-renewal of 36 months exceeds 12 |
+| medium | RENEW-01 | Northwind auto-renewal of 24 months exceeds 12 |
+| medium | NOTICE-01 | Cobalt termination notice of 15 days falls short of 30 |
+| low | LAW-01 | Cobalt names no governing law |
 
-Each is arithmetic, not opinion, and each cites the documents it came from.
+Each is arithmetic, not opinion, and each cites the documents it came from. `LIAB-01`
+computes its bound from another fact about the same vendor, which is why the two
+liability findings quote different limits.
+
+### The rules are configuration
+
+`rules/playbook.yaml`. Adding a rule is a data change; adding a rule *kind* is a code
+change, and four kinds cover the playbook. An unrecognised kind is refused when the
+playbook loads rather than skipped — a rule that never fires looks exactly like a rule
+that passes.
+
+The `numeric_bound` expression grammar (`2 * annual_fees`) is a deliberate ~20 lines
+rather than `eval()`. A playbook is configuration, and configuration that can execute
+Python is a remote code execution hole wearing a friendly name.
+
+### Verification can stop a run
+
+Before anything reaches a human or a commit, a separate pass re-checks every claim: it
+has a citation, the cited fact exists, and **the cited value still appears in the
+passage it came from**. That last one is the point — a citation naming a document
+proves nothing, and the dangerous failure is one that still looks fine while pointing
+at text that has since changed.
+
+If verification fails, the run stops. Nothing is committed, the run records `failed`,
+and the API reports `blocked_by_verification` — never `completed`. The human gate is
+deliberately skipped: showing a reviewer findings drawn from a register known to be
+unsound invites an approval that is worse than no approval at all.
 
 ### What it costs
 
@@ -212,6 +247,6 @@ And on a corpus with nothing wrong with it, the adjudication stage does not run 
 run and a stage that was never wired up must not look alike, so the skip is written
 down rather than omitted.
 
-Not yet built: the rules engine, the fresh-eyes verifier, and the folder watcher. Those
-stages are absent rather than stubbed — a capability may be honestly missing, never
+Not yet built: the folder watcher that triggers a run when a document arrives. That
+stage is absent rather than stubbed — a capability may be honestly missing, never
 present and broken. This README gains sections as the stages that back them land.

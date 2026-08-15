@@ -24,7 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ledger.hashing import content_hash, stable_json
-from ledger.models import SectionDependency, SectionVersion
+from ledger.models import Claim, ClaimCitation, SectionDependency, SectionVersion
 
 
 @dataclass(frozen=True)
@@ -35,11 +35,29 @@ class SectionPlan:
     kind: str
     payload: dict
     fact_ids: frozenset[UUID]
+    # The fact that establishes this section's value. Cited by the claim, and the
+    # thing Stage C checks still resolves. None means nothing governs, so the claim is
+    # recorded as unsupported rather than quietly asserted anyway.
+    governing_fact_id: UUID | None = None
 
     def render(self) -> str:
         """Deterministic rendering. Dict ordering must never affect the hash, or
         'unchanged' becomes a coin flip across runs."""
         return stable_json(self.payload)
+
+    def claim_text(self) -> str:
+        """The assertion this section makes, in the form a human would check it."""
+        vendor = self.payload.get("vendor", "?")
+        term = self.payload.get("term", "?")
+        value = self.payload.get("value")
+        if value is None:
+            return f"{vendor}: no supported value for {term}."
+
+        effective = self.payload.get("effective_date")
+        source = self.payload.get("governing_source")
+        suffix = f", per the {source}" if source else ""
+        suffix += f", effective {effective}" if effective else ""
+        return f"{vendor}: {term} is {value}{suffix}."
 
 
 @dataclass
@@ -154,7 +172,26 @@ def apply_plan(
             carried_forward=False,
         )
         session.add(version)
+        session.flush()
         written.append(version)
+
+        # Every section makes exactly one assertion, and that assertion carries its
+        # citations. This is where I1 stops being a promise: a claim with no resolvable
+        # citation is recorded as `unsupported`, which renders as the system declining
+        # to answer rather than as a confident value with nothing behind it.
+        claim = Claim(
+            section_version_id=version.id,
+            text=section.claim_text(),
+            status="supported" if section.governing_fact_id else "unsupported",
+        )
+        session.add(claim)
+        session.flush()
+
+        # Cite every contributing fact, not only the governing one. The superseded
+        # values are the evidence for *why* this value governs, and a reviewer asking
+        # "where did this come from" needs the whole chain, not just its last link.
+        for fact_id in section.fact_ids:
+            session.add(ClaimCitation(claim_id=claim.id, fact_id=fact_id))
 
         # Rewrite the dependency map for this section. Delete-then-insert because a
         # fact that no longer contributes must stop invalidating it — leaving a stale
@@ -179,7 +216,42 @@ def apply_plan(
             carried_forward=True,
         )
         session.add(version)
+        session.flush()
         written.append(version)
+
+        # Claims are copied forward too, so every version is self-describing.
+        #
+        # Without this a carried-forward section has no claims at all, and Stage C —
+        # which verifies claims — would silently skip exactly the sections we assert
+        # are unchanged. The verification would pass by having nothing to check, which
+        # is the most dangerous way for a check to pass.
+        prior_claims = (
+            session.execute(
+                select(Claim).where(Claim.section_version_id == prior.id)
+            )
+            .scalars()
+            .all()
+        )
+        for prior_claim in prior_claims:
+            copy = Claim(
+                section_version_id=version.id,
+                text=prior_claim.text,
+                status=prior_claim.status,
+            )
+            session.add(copy)
+            session.flush()
+
+            cited = (
+                session.execute(
+                    select(ClaimCitation.fact_id).where(
+                        ClaimCitation.claim_id == prior_claim.id
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for fact_id in cited:
+                session.add(ClaimCitation(claim_id=copy.id, fact_id=fact_id))
 
     session.flush()
     return written

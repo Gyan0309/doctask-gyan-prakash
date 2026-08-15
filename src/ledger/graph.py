@@ -16,6 +16,7 @@ resume.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 from uuid import UUID
@@ -34,6 +35,8 @@ from ledger.domain.extract import extract_from_document
 from ledger.domain.ingest import RawChunk, UnsupportedFormat, load_document
 from ledger.domain.normalize import normalize, normalize_date
 from ledger.domain.reconcile import FactView, reconcile
+from ledger.domain.rules import RuleError, evaluate, load_rules
+from ledger.domain.verify import verify_run
 from ledger.logging_config import get_logger, log, run_context, stage_context
 from ledger.metering import MeteredClient
 from ledger.models import Chunk, Conflict, Decision, Document, Fact, Finding, Run
@@ -59,6 +62,10 @@ class RunState(TypedDict, total=False):
     # corpus is clean and adjudication is skipped rather than asked to confirm it.
     conflict_candidates: list[dict[str, Any]]
     plan_summary: dict[str, int]
+    # False routes the run to `blocked`. Defaults to True only where absent, so a
+    # missing value can never be read as "verification passed".
+    verification_passed: bool
+    verification: dict[str, Any]
     decisions: dict[str, str]
     status: str
 
@@ -724,6 +731,7 @@ def compose(state: RunState) -> dict[str, Any]:
                         "observed": [f.value_raw for f in resolution.observations],
                     },
                     fact_ids=frozenset(f.fact_id for f in contributing),
+                    governing_fact_id=governing.fact_id if governing else None,
                 )
             )
 
@@ -744,6 +752,147 @@ def compose(state: RunState) -> dict[str, Any]:
         )
 
     return {"plan_summary": summary}
+
+
+@node("examine")
+def examine(state: RunState) -> dict[str, Any]:
+    """Stage A — apply the contract playbook to the reconciled values.
+
+    Deterministic and model-free. "Payment terms must be net 30 or better" is
+    arithmetic, and arithmetic done by a language model is arithmetic you cannot test.
+    """
+    settings = get_settings()
+    findings: list[dict[str, Any]] = []
+
+    try:
+        ruleset_id, rules = load_rules(settings.rules_path)
+    except (RuleError, OSError) as exc:
+        # A broken playbook is reported, not skipped. Rules silently not running is
+        # indistinguishable from rules passing, and that is the failure mode where a
+        # compliance report is confidently empty.
+        log(logger, logging.ERROR, "playbook could not be loaded", error=str(exc)[:300])
+        return {
+            "findings": [
+                {
+                    "severity": "high",
+                    "target_kind": "ruleset",
+                    "explanation": f"Rules were NOT applied: {exc}",
+                }
+            ]
+        }
+
+    with session_scope() as session:
+        views = _fact_views(session, state["corpus_id"], state.get("fact_ids", []))
+        violations = evaluate(rules, reconcile(views))
+
+        for violation in violations:
+            findings.append(
+                {
+                    "severity": violation.rule.severity,
+                    "target_kind": "rule",
+                    "explanation": f"[{violation.rule.code}] {violation.explanation}",
+                }
+            )
+
+        client = _client(session, state["run_id"])
+        client.record_stage("examine")
+
+        log(
+            logger,
+            logging.INFO,
+            "playbook applied",
+            ruleset=ruleset_id,
+            rules=len(rules),
+            violations=len(violations),
+        )
+
+    return {"findings": findings}
+
+
+@node("verify")
+def verify(state: RunState) -> dict[str, Any]:
+    """Stage C — a fresh pair of eyes over the composed register.
+
+    Re-derives nothing and trusts nothing: it checks that every claim still resolves to
+    evidence that still exists and still says what it said. A failure here **blocks the
+    commit** rather than annotating the output, because a run that cannot verify its own
+    claims has not succeeded, and saying otherwise is exactly the lie I5 forbids.
+    """
+    with session_scope() as session:
+        report = verify_run(session, UUID(state["run_id"]))
+
+        log(
+            logger,
+            logging.INFO if report.passed else logging.ERROR,
+            "verification passed" if report.passed else "VERIFICATION FAILED",
+            **report.summary(),
+        )
+
+        findings = [
+            {
+                "severity": "high",
+                "target_kind": "verification",
+                "explanation": f"[{failure.reason}] {failure.section_key}: {failure.detail}",
+            }
+            for failure in report.failures
+        ]
+
+        client = _client(session, state["run_id"])
+        client.record_stage("verify")
+
+        if not report.passed:
+            run = session.get(Run, UUID(state["run_id"]))
+            if run is not None:
+                run.status = "failed"
+
+    return {
+        "findings": findings,
+        "verification_passed": report.passed,
+        "verification": report.summary(),
+    }
+
+
+def route_after_verify(state: RunState) -> str:
+    """Decision point: unverified work never reaches the commit.
+
+    Routing to `blocked` rather than to `gate` is deliberate. Presenting a reviewer
+    with findings drawn from a register we know is unsound invites them to approve it,
+    and an approval obtained that way is worse than no approval at all.
+    """
+    return "gate" if state.get("verification_passed", True) else "blocked"
+
+
+@node("blocked")
+def blocked(state: RunState) -> dict[str, Any]:
+    """Terminal state for a run whose register failed verification.
+
+    Nothing is committed. The findings explaining *why* are already in state and are
+    persisted here, so the failure is inspectable rather than merely reported.
+    """
+    with session_scope() as session:
+        run = session.get(Run, UUID(state["run_id"]))
+        if run is not None:
+            run.status = "failed"
+            run.ended_at = datetime.now(UTC)
+
+        for payload in state.get("findings", []):
+            session.add(
+                Finding(
+                    run_id=UUID(state["run_id"]),
+                    severity=payload.get("severity", "low"),
+                    status="open",
+                    target_kind=payload.get("target_kind", "document"),
+                    explanation=payload.get("explanation", ""),
+                )
+            )
+
+    log(
+        logger,
+        logging.ERROR,
+        "run blocked: register failed verification, nothing committed",
+        **(state.get("verification") or {}),
+    )
+    return {"status": "blocked_by_verification"}
 
 
 @node("gate")
@@ -839,6 +988,9 @@ def build_graph(checkpointer=None):
     builder.add_node("detect_conflicts", detect_conflicts)
     builder.add_node("adjudicate", adjudicate_conflicts)
     builder.add_node("compose", compose)
+    builder.add_node("examine", examine)
+    builder.add_node("verify", verify)
+    builder.add_node("blocked", blocked)
     builder.add_node("gate", gate)
     builder.add_node("commit", commit)
 
@@ -864,7 +1016,16 @@ def build_graph(checkpointer=None):
         {"adjudicate": "adjudicate", "compose": "compose"},
     )
     builder.add_edge("adjudicate", "compose")
-    builder.add_edge("compose", "gate")
+    builder.add_edge("compose", "examine")
+    builder.add_edge("examine", "verify")
+
+    # Decision point: an unverified register never reaches a human or a commit.
+    builder.add_conditional_edges(
+        "verify",
+        route_after_verify,
+        {"gate": "gate", "blocked": "blocked"},
+    )
+    builder.add_edge("blocked", END)
     builder.add_edge("gate", "commit")
     builder.add_edge("commit", END)
 

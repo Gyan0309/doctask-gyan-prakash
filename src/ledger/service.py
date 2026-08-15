@@ -189,10 +189,20 @@ def _describe(run_id: str, state: dict[str, Any], config: dict[str, Any]) -> dic
                 if isinstance(value, dict):
                     pending = value.get("findings", [])
 
+    # A blocked run reports blocked, never "completed". I5: a success message must
+    # mean the output is genuinely in the state claimed.
+    if state.get("verification_passed") is False:
+        status = "blocked_by_verification"
+    elif awaiting:
+        status = "awaiting_review"
+    else:
+        status = state.get("status", "unknown")
+
     return {
         "run_id": run_id,
-        "status": "awaiting_review" if awaiting else state.get("status", "unknown"),
+        "status": status,
         "awaiting_review": awaiting,
+        "verification": state.get("verification", {}),
         "pending_findings": pending,
         "plan": state.get("plan_summary", {}),
         "counts": {

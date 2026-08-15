@@ -127,30 +127,40 @@ class FakeProvider(ModelProvider):
         if enum := schema.get("enum"):
             return enum[seed % len(enum)]
 
-        # A synthesized `quote` must actually appear in the source, or every fact this
-        # provider produces gets rejected by citation resolution and the offline path
-        # can never exercise anything downstream of extraction. Returning a real line
-        # from the document keeps the stub deterministic *and* honest: the citation it
-        # emits is genuinely resolvable, exactly as a real one must be.
-        if field_name == "quote":
+        # `quote` and `value_raw` must both come from the SAME line of the real source.
+        #
+        # The quote makes the citation resolvable; the value must then be findable in
+        # the chunk that quote resolved to, because Stage C verification re-checks
+        # exactly that. Deriving them from independent seeds produced facts whose
+        # values appeared nowhere in the document — so every offline run failed its own
+        # verification and blocked, which is Stage C working correctly on a stub that
+        # was fabricating evidence.
+        #
+        # Both therefore key off the parent object's prompt rather than their own field
+        # name, so they agree on which line they are describing.
+        if field_name in ("quote", "value_raw"):
             lines = self._source_lines(root_prompt)
             if lines:
-                return lines[seed % len(lines)]
+                parent = prompt.rsplit(":", 1)[0]
+                line = lines[self._seed(parent) % len(lines)]
+                if field_name == "quote":
+                    return line
+                return self._number_in(line) or line[:40]
 
-        # Values must be *shaped* like the real thing, not merely unique. A stub
-        # returning "fake-3f5d3cf9" as an hourly rate fails normalization on every
-        # fact, so every offline run manufactures findings, parks at the human gate,
-        # and never completes — which then silently disables incrementality testing,
-        # because an incremental run needs a completed predecessor. Plausible values
-        # keep the offline path exercising the same code the real one does.
-        if field_name == "value_raw":
-            return str(50 + seed % 950)
         if field_name == "effective_date":
             return f"202{4 + seed % 3}-{1 + seed % 12:02d}-01"
         if field_name in ("subject", "vendor"):
             return f"Vendor{seed % 4}"
 
         return f"fake-{seed:08x}"
+
+    @staticmethod
+    def _number_in(line: str) -> str | None:
+        """The first number in a line, kept in the form the document wrote it."""
+        import re
+
+        match = re.search(r"\$?\d[\d,]*(?:\.\d+)?", line)
+        return match.group(0) if match else None
 
     # -- interface -----------------------------------------------------------
 
