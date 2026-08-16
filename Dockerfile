@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements-dev.txt
 
 # Packages live flat at the repository root, so they are copied as they are and
 # imported directly. PYTHONPATH=/app is what makes that work; there is no build step.
-COPY pytest.ini pyproject.toml alembic.ini ./
+COPY pytest.ini pyproject.toml alembic.ini conftest.py ./
 COPY main.py ./
 COPY api/ ./api/
 COPY database/ ./database/

@@ -38,6 +38,7 @@ from models import (
 )
 from services.graph import build_graph
 from utils.logging_config import get_logger, log, run_context, timed
+from utils.paths import basename
 
 logger = get_logger(__name__)
 
@@ -404,7 +405,7 @@ def get_provenance(run_id: str, section_key: str) -> dict[str, Any]:
                         "effective_date": (
                             fact.effective_date.isoformat() if fact.effective_date else None
                         ),
-                        "document": Path(document.uri).name,
+                        "document": basename(document.uri),
                         "document_kind": document.kind,
                         "confidence": fact.confidence,
                         # The passage itself. Without it a citation is a filename, and a

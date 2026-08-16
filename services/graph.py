@@ -43,6 +43,7 @@ from models import Chunk, Conflict, Decision, Document, Fact, Finding, Run
 from providers import build_provider
 from services.metering import MeteredClient
 from utils.logging_config import get_logger, log, run_context, stage_context
+from utils.paths import basename
 
 
 def _merge(existing: list, incoming: list) -> list:
@@ -251,7 +252,7 @@ def classify(state: RunState) -> dict[str, Any]:
                 # have changed, and re-asking would pay for it again.
                 continue
 
-            name = Path(document.uri).name
+            name = basename(document.uri)
             text = "\n\n".join(
                 c.text
                 for c in session.query(Chunk)
@@ -398,7 +399,7 @@ def extract(state: RunState) -> dict[str, Any]:
                     logger,
                     logging.INFO,
                     "facts already extracted for this document; model not called",
-                    document=Path(document.uri).name,
+                    document=basename(document.uri),
                     facts=len(already),
                 )
                 fact_ids.extend(str(f.id) for f in already)
@@ -410,7 +411,7 @@ def extract(state: RunState) -> dict[str, Any]:
                 .order_by(Chunk.ordinal)
                 .all()
             )
-            name = Path(document.uri).name
+            name = basename(document.uri)
 
             raw_chunks = [
                 RawChunk(

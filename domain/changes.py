@@ -19,7 +19,6 @@ afterwards.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from uuid import UUID
 
 from sqlalchemy import select
@@ -32,6 +31,7 @@ from models import (
     Run,
     SectionVersion,
 )
+from utils.paths import basename
 
 
 @dataclass
@@ -86,7 +86,7 @@ def _citing_documents(session, section_version_id: UUID) -> set[str]:
         .join(Claim, Claim.id == ClaimCitation.claim_id)
         .where(Claim.section_version_id == section_version_id)
     ).scalars().all()
-    return {Path(uri).name for uri in rows}
+    return {basename(uri) for uri in rows}
 
 
 def build_ledger(session, run_id: UUID) -> ChangeLedger:
