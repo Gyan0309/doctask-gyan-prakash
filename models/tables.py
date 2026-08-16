@@ -417,7 +417,8 @@ class Run(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('running','awaiting_review','completed','failed','escalated')",
+            "status IN ('running','awaiting_review','completed','failed',"
+            "'escalated','interrupted')",
             name="ck_run_status",
         ),
         Index("ix_run_corpus", "corpus_id"),

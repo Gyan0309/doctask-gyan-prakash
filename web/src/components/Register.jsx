@@ -33,6 +33,7 @@ export default function Register({ deliverable, changes, selectedKey, onSelect }
         </p>
       )}
 
+      <div className="tablewrap">
       <table>
         <thead>
           <tr>
@@ -90,6 +91,7 @@ export default function Register({ deliverable, changes, selectedKey, onSelect }
           })}
         </tbody>
       </table>
+      </div>
     </section>
   );
 }

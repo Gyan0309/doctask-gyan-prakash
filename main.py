@@ -17,13 +17,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from api.routes import router
 from database import db
 from database.config import get_settings
+from domain.ingest import SUPPORTED_SUFFIXES
 from providers import build_provider
 from providers.base import ProviderError
 from services import service
@@ -106,6 +107,11 @@ async def announce_startup() -> None:
         watching=settings.watch_enabled,
     )
 
+    # Nothing can be mid-run while this process is still booting, so any row saying so
+    # is a run whose process died. Marked before the API serves its first request —
+    # otherwise the first caller reads a status that was never true.
+    service.mark_interrupted_runs()
+
     # The watcher instance always exists; `watch_enabled` controls only whether it
     # polls on a timer. The two were conflated at first, so /watch/poll fell back to
     # constructing a throwaway Watcher per request — with empty state, which made every
@@ -161,6 +167,59 @@ def watch_poll() -> dict[str, Any]:
         "added": result.added,
         "modified": result.modified,
         "removed": result.removed,
+        "triggered": result.triggered,
+        "run_id": result.run_id,
+    }
+
+
+# Module-level so the call is not evaluated in a default argument on every request.
+_UPLOADED_FILES = File(...)
+
+
+@app.post("/documents/upload")
+async def upload_documents(files: list[UploadFile] = _UPLOADED_FILES) -> dict[str, Any]:
+    """Accept documents through the browser and hand them to the watcher.
+
+    Deliberately *not* a second ingestion path: the file lands in the watched
+    directory and the existing poll picks it up, so an upload and a file dropped into
+    the folder converge on the same code within one line of each other. A parallel
+    "upload run" would be a second path to keep correct, and the one used less often
+    is the one that rots.
+    """
+    if _watcher is None:  # pragma: no cover - startup always creates it
+        raise HTTPException(status_code=503, detail="watcher not initialised")
+
+    directory = get_settings().watch_dir
+    directory.mkdir(parents=True, exist_ok=True)
+
+    saved: list[str] = []
+    for upload in files:
+        # basename() only — an uploaded name is caller-controlled, and "../../etc/x"
+        # is a path traversal write, not a document.
+        name = Path(upload.filename or "").name
+        if not name:
+            raise HTTPException(status_code=400, detail="a file arrived with no name")
+
+        suffix = Path(name).suffix.lower()
+        if suffix not in SUPPORTED_SUFFIXES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{name}: unsupported format '{suffix or 'none'}'. "
+                    f"Supported: {', '.join(sorted(SUPPORTED_SUFFIXES))}."
+                ),
+            )
+
+        (directory / name).write_bytes(await upload.read())
+        saved.append(name)
+
+    log(logger, logging.INFO, "documents uploaded", files=", ".join(saved))
+
+    result = _watcher.poll()
+    return {
+        "saved": saved,
+        "added": result.added,
+        "modified": result.modified,
         "triggered": result.triggered,
         "run_id": result.run_id,
     }

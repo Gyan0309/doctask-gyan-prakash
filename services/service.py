@@ -217,6 +217,96 @@ def resume_run(
         return _describe(run_id, state, config)
 
 
+class ResumeFailed(RuntimeError):
+    """A resume was attempted and could not complete — most often a source document
+    that has moved since the run started. The run stays resumable."""
+
+
+def mark_interrupted_runs() -> int:
+    """At startup, no run can still be in flight — so any row claiming otherwise lied.
+
+    Called from the API's startup hook. A run is driven by an in-process graph, so if
+    this process is only now booting, nothing is executing the runs the database still
+    marks `running`: their process died. Left alone the row says `running` forever, and
+    an API reporting work in progress that nothing is progressing is the same class of
+    untruth as a false success.
+
+    Safe because the service runs as a single uvicorn process (no `--workers`). Under
+    multiple workers this would need a heartbeat instead, since one worker booting
+    would say nothing about another worker's live runs.
+    """
+    with session_scope() as session:
+        orphans = session.execute(
+            select(Run).where(Run.status == "running")
+        ).scalars().all()
+
+        for run in orphans:
+            run.status = "interrupted"
+
+        count = len(orphans)
+
+    if count:
+        log(
+            logger,
+            logging.WARNING,
+            "runs found still marked running at startup; their process died",
+            runs=count,
+            note="resumable via POST /runs/{id}/resume",
+        )
+    return count
+
+
+def resume_interrupted(run_id: str) -> dict[str, Any]:
+    """Continue a run whose process was killed, from its last checkpoint.
+
+    Distinct from `resume_run`, which answers a human gate. This one supplies no value
+    — LangGraph re-enters the graph at the node after the last one that checkpointed,
+    which is exactly the seam a crash lands on. Nothing completed is recomputed.
+    """
+    with session_scope() as session:
+        run = session.get(Run, UUID(run_id))
+        if run is None:
+            raise KeyError(run_id)
+        if run.status not in ("interrupted", "running"):
+            raise ValueError(
+                f"run {run_id} is {run.status}; only an interrupted run can be resumed"
+            )
+        run.status = "running"
+
+    graph = build_graph(get_checkpointer())
+    config = {"configurable": {"thread_id": run_id}}
+
+    with run_context(run_id):
+        log(logger, logging.INFO, "resuming interrupted run from its last checkpoint")
+        try:
+            with timed(logger, "resume_interrupted", run_id=run_id):
+                state = graph.invoke(None, config)
+        except Exception as exc:
+            # Put the run back where it was. Without this a failed resume leaves the
+            # row saying `running` — recreating exactly the ghost this operation exists
+            # to clear, and making the second attempt look like a live run.
+            #
+            # `interrupted` rather than `failed` because the usual cause is a source
+            # document that moved: the run is still resumable once it is back, and
+            # marking it failed would throw away recoverable work.
+            with session_scope() as session:
+                run = session.get(Run, UUID(run_id))
+                if run is not None:
+                    run.status = "interrupted"
+            log(
+                logger,
+                logging.ERROR,
+                "resume failed; run left interrupted and still resumable",
+                error=type(exc).__name__,
+                detail=str(exc)[:300],
+            )
+            raise ResumeFailed(f"{type(exc).__name__}: {exc}") from exc
+
+        result = _describe(run_id, state, config)
+        log(logger, logging.INFO, "interrupted run resumed", status=result["status"])
+        return result
+
+
 def _describe(run_id: str, state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     graph = build_graph(get_checkpointer())
     snapshot = graph.get_state(config)
@@ -264,7 +354,7 @@ def get_run(run_id: str) -> dict[str, Any]:
             select(StageMetric).where(StageMetric.run_id == run.id)
         ).scalars().all()
 
-        return {
+        result = {
             "run_id": run_id,
             "status": run.status,
             "mode": run.mode,
@@ -283,6 +373,28 @@ def get_run(run_id: str) -> dict[str, Any]:
                 for s in stages
             ],
         }
+
+    # The findings a reviewer needs to see live only in the graph checkpoint while a
+    # run sits at the gate — they aren't written to the `finding` table until commit.
+    # Without this, the only way to ever see them was the single synchronous response
+    # that started or resumed the run; a page reload or a second client asking "what's
+    # pending on this run?" got "running" and nothing else. That is the exact request
+    # the review UI makes on every load, so the gate was unreachable outside the tab
+    # that happened to trigger it.
+    result["awaiting_review"] = False
+    result["pending_findings"] = []
+    if result["status"] == "awaiting_review":
+        graph = build_graph(get_checkpointer())
+        snapshot = graph.get_state({"configurable": {"thread_id": run_id}})
+        if snapshot.next and "gate" in snapshot.next:
+            for task in snapshot.tasks:
+                for intr in getattr(task, "interrupts", ()) or ():
+                    value = getattr(intr, "value", None)
+                    if isinstance(value, dict):
+                        result["awaiting_review"] = True
+                        result["pending_findings"] = value.get("findings", [])
+
+    return result
 
 
 def get_deliverable(run_id: str) -> dict[str, Any]:

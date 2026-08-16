@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from models import Claim, ClaimCitation, SectionDependency, SectionVersion
@@ -147,7 +147,19 @@ def apply_plan(
     Carried-forward sections copy the previous content and hash byte for byte. This is
     what makes "untouched sections are byte-identical" true by construction rather
     than by luck — there is no code path in which an untouched section is regenerated.
+
+    Re-entrant by design. LangGraph checkpoints at node boundaries, so a process killed
+    inside compose leaves rows written by an attempt that never committed its
+    checkpoint; on resume the node runs again and collided with its own torn output on
+    `uq_section_version_run_key`, failing the run it was supposed to rescue. Clearing
+    this run's own prior rows first is safe in a way that clearing anything else would
+    not be: they are a partial write by definition, and re-deriving reproduces them.
+    Scoped to `run_id` — deleting a *previous* run's versions would destroy the very
+    bytes the carry-forward comparison proves itself against.
     """
+    session.execute(delete(SectionVersion).where(SectionVersion.run_id == run_id))
+    session.flush()
+
     written: list[SectionVersion] = []
 
     previous: dict[str, SectionVersion] = {}

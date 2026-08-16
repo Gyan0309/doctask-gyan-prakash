@@ -12,7 +12,10 @@ import * as api from "../api";
  * Nothing is submitted until the reviewer presses the button, so changing your mind
  * about item three after deciding item five costs nothing.
  */
-export default function ReviewGate({ runId, run, onDecided }) {
+const SEVERITIES = ["high", "medium", "low"];
+const RANK = { high: 0, medium: 1, low: 2 };
+
+export default function ReviewGate({ runId, run, onDecided, onShowEvidence }) {
   const [verdicts, setVerdicts] = useState({});
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
@@ -28,6 +31,19 @@ export default function ReviewGate({ runId, run, onDecided }) {
     setVerdicts(Object.fromEntries(findings.map((f) => [String(f.index), "approved"])));
     setError(null);
   }, [runId, findings.length, awaiting]);
+
+  const resume = async () => {
+    setSubmitting(true);
+    setError(null);
+    try {
+      await api.resumeRun(runId);
+      await onDecided();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   if (!run) return null;
 
@@ -47,10 +63,26 @@ export default function ReviewGate({ runId, run, onDecided }) {
     );
   }
 
+  if (run.status === "interrupted") {
+    return (
+      <div className="finding">
+        <strong>This run was interrupted.</strong>
+        <p>
+          Its process stopped mid-run. Nothing finished was lost — resuming continues
+          from the last completed stage rather than starting over.
+        </p>
+        <button className="primary" onClick={resume} disabled={submitting}>
+          {submitting ? "Resuming…" : "Resume this run"}
+        </button>
+        {error && <div className="error" style={{ marginTop: 10 }}>{error}</div>}
+      </div>
+    );
+  }
+
   if (!awaiting) {
     return (
       <p className="empty">
-        Nothing awaiting review{run.status ? ` — run is ${run.status}` : ""}.
+        Nothing awaiting review{run.status ? ` — run is ${run.status.replace(/_/g, " ")}` : ""}.
       </p>
     );
   }
@@ -71,8 +103,22 @@ export default function ReviewGate({ runId, run, onDecided }) {
     }
   };
 
+  const setAll = (verdict) =>
+    setVerdicts(Object.fromEntries(findings.map((f) => [String(f.index), verdict])));
+
   const approved = Object.values(verdicts).filter((v) => v === "approved").length;
   const rejected = findings.length - approved;
+
+  // Severity order, not the order the pipeline happened to emit them in. A reviewer
+  // working top to bottom should meet the $1.2M liability breach before a missing
+  // governing-law clause, and attention is highest on the first few items.
+  const ordered = [...findings].sort(
+    (a, b) => (RANK[a.severity] ?? 9) - (RANK[b.severity] ?? 9),
+  );
+  const counts = findings.reduce((acc, f) => {
+    acc[f.severity] = (acc[f.severity] ?? 0) + 1;
+    return acc;
+  }, {});
 
   return (
     <section>
@@ -80,21 +126,42 @@ export default function ReviewGate({ runId, run, onDecided }) {
 
       {error && <div className="error">{error}</div>}
 
-      {findings.map((finding) => {
+      <div className="gatebar">
+        <div className="tally">
+          {SEVERITIES.filter((s) => counts[s]).map((s) => (
+            <span key={s} className={`pill ${s}`}>
+              {counts[s]} {s}
+            </span>
+          ))}
+        </div>
+        {/* Bulk verdicts still submit per item — the payload is one verdict per
+            finding either way. This only saves clicks on the runs where a reviewer
+            has genuinely made one decision about everything. */}
+        <div className="bulk">
+          <button onClick={() => setAll("approved")}>Approve all</button>
+          <button onClick={() => setAll("rejected")}>Reject all</button>
+        </div>
+      </div>
+
+      {ordered.map((finding) => {
         const key = String(finding.index);
+        const verdict = verdicts[key];
         return (
-          <div className="finding" key={key}>
-            <div style={{ marginBottom: 6 }}>
-              <span className={`pill ${finding.severity}`}>{finding.severity}</span>{" "}
-              <span className="pill">{finding.target_kind}</span>
+          <div className={`finding sev-${finding.severity} ${verdict === "rejected" ? "is-rejected" : ""}`} key={key}>
+            <div className="finding-head">
+              <span className={`pill ${finding.severity}`}>{finding.severity}</span>
+              <span className="pill">{finding.rule_code ?? finding.target_kind}</span>
+              {finding.subject && <span className="subject">{finding.subject}</span>}
             </div>
+
             <p>{finding.explanation}</p>
+
             <div className="verdicts">
               <label>
                 <input
                   type="radio"
                   name={`verdict-${key}`}
-                  checked={verdicts[key] === "approved"}
+                  checked={verdict === "approved"}
                   onChange={() => setVerdict(finding.index, "approved")}
                 />
                 Approve
@@ -103,21 +170,32 @@ export default function ReviewGate({ runId, run, onDecided }) {
                 <input
                   type="radio"
                   name={`verdict-${key}`}
-                  checked={verdicts[key] === "rejected"}
+                  checked={verdict === "rejected"}
                   onChange={() => setVerdict(finding.index, "rejected")}
                 />
                 Reject
               </label>
+
+              {/* The evidence, one click away. Approving a finding you have not
+                  checked is the failure this gate exists to prevent, and making the
+                  reviewer hunt the register for the matching row is how that happens.
+                  Absent when the finding is that nothing was found — there is no
+                  source passage for a clause that does not exist. */}
+              {finding.section_key && onShowEvidence && (
+                <button className="link" onClick={() => onShowEvidence(finding.section_key)}>
+                  Show evidence
+                </button>
+              )}
             </div>
           </div>
         );
       })}
 
-      <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 12 }}>
+      <div className="gatefoot">
         <button className="primary" onClick={submit} disabled={submitting}>
           {submitting ? "Submitting…" : `Submit ${findings.length} decisions`}
         </button>
-        <span className="sub" style={{ color: "var(--muted)", fontSize: 13 }}>
+        <span className="tally-text">
           {approved} approved, {rejected} rejected
         </span>
       </div>

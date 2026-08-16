@@ -237,6 +237,149 @@ class TestFloorTwoSurvivesBeingKilled:
         )
         assert facts_before >= 0  # sanity: the query above ran
 
+    def test_a_killed_run_is_not_left_claiming_to_be_running(
+        self, tmp_path, database_url
+    ) -> None:
+        """The run whose process died must stop describing itself as in flight.
+
+        Starting a fresh run over the same corpus recovers the *work* — the test above
+        proves that. It does nothing for the killed run itself, which keeps its
+        `running` row forever. An API reporting work in progress that nothing is
+        progressing is the same class of untruth as a false success, and it is what a
+        reviewer sees first: a run list with permanent ghosts in it.
+        """
+        source = tmp_path / "msa.md"
+        source.write_text(MSA, encoding="utf-8")
+        marker = tmp_path / "run_id.txt"
+        script = tmp_path / "kill.py"
+        script.write_text(KILL_SCRIPT, encoding="utf-8")
+
+        env = {
+            **os.environ,
+            "DATABASE_URL": database_url,
+            "LLM_PROVIDER": "fake",
+            "LOG_LEVEL": "WARNING",
+            "PYTHONPATH": ".",
+        }
+
+        proc = subprocess.run(
+            [sys.executable, str(script), _unique("floor2-ghost"), str(source), str(marker)],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            timeout=180,
+        )
+        assert marker.exists(), (
+            f"the child never reached the kill point; stderr:\n"
+            f"{proc.stderr.decode()[-2000:]}"
+        )
+        killed_run_id = marker.read_text().strip()
+
+        assert service.get_run(killed_run_id)["status"] == "running", (
+            "precondition: the killed run is still marked running"
+        )
+
+        # What the API does on startup, when nothing can legitimately be in flight.
+        service.mark_interrupted_runs()
+
+        assert service.get_run(killed_run_id)["status"] == "interrupted"
+
+    def test_an_interrupted_run_resumes_from_its_own_checkpoint(
+        self, tmp_path, database_url
+    ) -> None:
+        """Floor 2 says the run continues from where it left off — that run, not a
+        replacement for it."""
+        source = tmp_path / "msa.md"
+        source.write_text(MSA, encoding="utf-8")
+        marker = tmp_path / "run_id.txt"
+        script = tmp_path / "kill.py"
+        script.write_text(KILL_SCRIPT, encoding="utf-8")
+
+        env = {
+            **os.environ,
+            "DATABASE_URL": database_url,
+            "LLM_PROVIDER": "fake",
+            "LOG_LEVEL": "WARNING",
+            "PYTHONPATH": ".",
+        }
+
+        subprocess.run(
+            [sys.executable, str(script), _unique("floor2-resume"), str(source), str(marker)],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            timeout=180,
+        )
+        assert marker.exists()
+        killed_run_id = marker.read_text().strip()
+
+        service.mark_interrupted_runs()
+        resumed = _complete(service.resume_interrupted(killed_run_id))
+
+        assert resumed["run_id"] == killed_run_id, "the original run must be the one that finishes"
+        assert resumed["status"] == "completed"
+
+        # And it did not start over: extraction ran before the kill, so resuming past
+        # that node must not have paid for it again.
+        stages = {s["stage"]: s for s in service.get_run(killed_run_id)["stages"]}
+        assert stages["extract"]["cache_misses"] == 0, (
+            f"resumption re-ran completed work; stages={stages}"
+        )
+
+    def test_a_failed_resume_does_not_recreate_the_ghost(
+        self, tmp_path, database_url
+    ) -> None:
+        """Resuming sets the run back to `running`. If the attempt then dies — the
+        usual cause being a source document that has since moved — that status must not
+        be what it is left with, or the failed rescue recreates the exact stuck row it
+        was meant to clear."""
+        source = tmp_path / "msa.md"
+        source.write_text(MSA, encoding="utf-8")
+        marker = tmp_path / "run_id.txt"
+        script = tmp_path / "kill.py"
+        script.write_text(KILL_SCRIPT, encoding="utf-8")
+
+        subprocess.run(
+            [sys.executable, str(script), _unique("floor2-lost"), str(source), str(marker)],
+            cwd=os.getcwd(),
+            env={
+                **os.environ,
+                "DATABASE_URL": database_url,
+                "LLM_PROVIDER": "fake",
+                "LOG_LEVEL": "WARNING",
+                "PYTHONPATH": ".",
+            },
+            capture_output=True,
+            timeout=180,
+        )
+        assert marker.exists()
+        killed_run_id = marker.read_text().strip()
+        service.mark_interrupted_runs()
+
+        # The document the run was reading is gone.
+        source.unlink()
+
+        with pytest.raises(service.ResumeFailed):
+            service.resume_interrupted(killed_run_id)
+
+        assert service.get_run(killed_run_id)["status"] == "interrupted", (
+            "a failed resume must leave the run resumable, not stuck at running"
+        )
+
+    def test_a_finished_run_cannot_be_resumed(self, tmp_path) -> None:
+        """Resuming a completed run would re-enter a graph that has nothing left to do
+        and rewrite a settled result. Refused, with the reason."""
+        (tmp_path / "msa.md").write_text(MSA, encoding="utf-8")
+        finished = _complete(
+            service.start_run(
+                corpus_name=_unique("floor2-done"),
+                document_paths=[str(tmp_path / "msa.md")],
+            )
+        )
+
+        with pytest.raises(ValueError, match="completed"):
+            service.resume_interrupted(finished["run_id"])
+
 
 # ---------------------------------------------------------------------------
 # Floor 3 — a real human gate, per item
@@ -307,6 +450,40 @@ class TestFloorThreeHumanGate:
         with session_scope() as session:
             run = session.get(Run, uuid.UUID(parked["run_id"]))
             assert run.status != "completed"
+
+    def test_the_gate_is_reachable_by_asking_the_run_about_itself(self, parked) -> None:
+        """A parked run must announce itself to anyone who asks, not only to the
+        caller who happened to start it.
+
+        `start_run` returns the findings once, synchronously. If that return value is
+        the only place they exist, a reviewer who reloads the page — or any second
+        client — sees a run marked `running` with nothing pending, and the gate is
+        unreachable for everyone except the tab that triggered it. That is the whole
+        review surface disappearing while every stage still reports success.
+        """
+        seen = service.get_run(parked["run_id"])
+
+        assert seen["status"] == "awaiting_review", (
+            "a run parked at the gate must not still report itself as running"
+        )
+        assert seen["awaiting_review"] is True
+        assert len(seen["pending_findings"]) == len(parked["pending_findings"]), (
+            "the findings must be readable from the run itself, not only from the "
+            "response that started it"
+        )
+
+    def test_the_status_returns_to_completed_after_review(self, parked) -> None:
+        """The flip side: `awaiting_review` must clear, or the run advertises a gate
+        that is no longer there and a reviewer is asked to decide twice."""
+        service.resume_run(
+            run_id=parked["run_id"],
+            decisions={str(f["index"]): "approved" for f in parked["pending_findings"]},
+        )
+        seen = service.get_run(parked["run_id"])
+
+        assert seen["status"] != "awaiting_review"
+        assert seen["awaiting_review"] is False
+        assert seen["pending_findings"] == []
 
 
 # ---------------------------------------------------------------------------

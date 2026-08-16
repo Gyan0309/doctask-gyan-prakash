@@ -47,3 +47,14 @@ export const submitDecisions = (runId, decisions) =>
   });
 
 export const pollWatch = () => request("/watch/poll", { method: "POST" });
+
+// Continue a run whose process died, from its last checkpoint.
+export const resumeRun = (runId) => request(`/runs/${runId}/resume`, { method: "POST" });
+
+// No Content-Type: the browser must set it itself to include the multipart boundary,
+// and naming it here produces a body the server cannot parse.
+export const uploadDocuments = (fileList) => {
+  const body = new FormData();
+  for (const file of fileList) body.append("files", file);
+  return request("/documents/upload", { method: "POST", body, headers: {} });
+};

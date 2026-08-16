@@ -63,6 +63,31 @@ def decide(run_id: str, request: DecisionsRequest) -> dict[str, Any]:
     return service.resume_run(run_id=run_id, decisions=request.decisions)
 
 
+@router.post("/runs/{run_id}/resume")
+def resume(run_id: str) -> dict[str, Any]:
+    """Continue a run whose process was killed, from its last checkpoint.
+
+    Floor 2 is "kill it and start it again". Without this the only recovery was to
+    start a *new* run over the same corpus and let the cache absorb the cost — which
+    loses no work, but abandons the run that was interrupted and leaves it saying
+    `running` forever.
+    """
+    try:
+        return service.resume_interrupted(run_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"no run {run_id}") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except service.ResumeFailed as exc:
+        # A missing source document is an ordinary condition, not a server fault, and
+        # a bare 500 hides the one thing the caller needs to know. The run is left
+        # resumable, so this says what to fix rather than what broke.
+        raise HTTPException(
+            status_code=422,
+            detail=f"resume could not complete: {exc}. The run is still interrupted.",
+        ) from None
+
+
 @router.get("/runs/{run_id}/decisions")
 def list_decisions(run_id: str) -> list[dict[str, Any]]:
     return service.get_decisions(run_id)

@@ -39,7 +39,7 @@ from domain.normalize import normalize, normalize_date
 from domain.reconcile import FactView, reconcile
 from domain.rules import RuleError, evaluate, load_rules
 from domain.verify import verify_run
-from models import Chunk, Conflict, Decision, Document, Fact, Finding, Run
+from models import Chunk, Conflict, Decision, Document, Fact, Finding, Run, SectionVersion
 from providers import build_provider
 from services.metering import MeteredClient
 from utils.logging_config import get_logger, log, run_context, stage_context
@@ -856,11 +856,32 @@ def examine(state: RunState) -> dict[str, Any]:
         views = _fact_views(session, state["corpus_id"], state.get("fact_ids", []))
         violations = evaluate(rules, reconcile(views))
 
+        # Compose runs before this stage, so the register already exists and a finding
+        # can point at the row it is about. Attached only after confirming the key is
+        # really there: a reviewer who clicks "show me the evidence" and gets nothing
+        # learns to stop clicking, which costs more than never offering the link.
+        #
+        # Rules only ever evaluate unscoped resolutions, so the key is subject and
+        # predicate. A `presence_required` violation has no section by definition —
+        # the whole finding is that nothing was found — and correctly gets no link.
+        section_keys = set(
+            session.execute(
+                select(SectionVersion.section_key).where(
+                    SectionVersion.run_id == UUID(state["run_id"])
+                )
+            ).scalars()
+        )
+
         for violation in violations:
+            candidate = f"{violation.subject}::{violation.rule.predicate}"
             findings.append(
                 {
                     "severity": violation.rule.severity,
                     "target_kind": "rule",
+                    "rule_code": violation.rule.code,
+                    "subject": violation.subject,
+                    "predicate": violation.rule.predicate,
+                    "section_key": candidate if candidate in section_keys else None,
                     "explanation": f"[{violation.rule.code}] {violation.explanation}",
                 }
             )
@@ -983,6 +1004,16 @@ def gate(state: RunState) -> dict[str, Any]:
         return {"status": "no_review_required"}
 
     log(logger, logging.INFO, "presenting findings for human review", pending=len(findings))
+
+    # Persisted before interrupt() pauses execution, so a GET on this run — which
+    # reads this column, not the checkpoint — reports the true state instead of the
+    # "running" it was created with. Without this a run parked at the gate looks
+    # identical to one still mid-pipeline to anyone polling it from outside the
+    # process that started it, which is every request the review UI makes.
+    with session_scope() as session:
+        run = session.get(Run, UUID(state["run_id"]))
+        if run is not None:
+            run.status = "awaiting_review"
 
     answer = interrupt(
         {

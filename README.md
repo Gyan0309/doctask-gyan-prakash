@@ -48,8 +48,8 @@ Override with `DB_HOST_PORT` if 55432 is also taken.
 ## Tests
 
 ```bash
-pytest                      # 180 tests
-pytest -m "not integration" # 123 of them need no database either
+pytest                      # 200 tests
+pytest -m "not integration" # 130 of them need no database either
 ```
 
 **Every test runs with no API key, no network, and no recorded fixtures.** CI holds no
@@ -87,16 +87,92 @@ detected deterministically and adjudicated by a model → the register is compos
 that is not the composer checks every claim against its sources → a human approves or
 rejects each finding individually → the result is committed with content hashes.
 
-Five points in that path genuinely change the route taken, rather than logging a label
-on a fixed script:
+Four points in that path genuinely change the route taken, rather than logging a label
+on a fixed script. Three are conditional edges in the graph — visible in
+`build_graph()`, observable in the checkpoint, and not an `if` buried inside a node:
 
-| Decision | Alternate path |
+| Decision | Alternate path | Where |
+|---|---|---|
+| Classification confidence below threshold | Escalate to a human instead of guessing | conditional edge |
+| No conflict candidates found | Skip adjudication entirely — the honest clean path, and it costs nothing | conditional edge |
+| Verification fails | Route to `blocked`: nothing commits, the human gate is **not** offered, and the run records `failed` | conditional edge |
+| Extraction fails its schema | Retry twice with a repair prompt, then skip that document and emit a finding | inside the node |
+
+Two paths that would be natural here deliberately **do not** exist, and the reasoning
+is part of the design rather than an omission:
+
+- **Verification failure does not loop back to compose.** Re-composing the same facts
+  produces the same register, so a retry would burn calls to reach the same verdict.
+  A failed verification is a reason to stop, not to try again.
+- **Rejecting a finding does not re-run adjudication.** Findings are observations about
+  the corpus, not edits waiting to be applied — a rejection is recorded, kept auditable,
+  and left out of the committed set. Re-adjudicating would ask the model to overturn a
+  human, which is the wrong direction of authority for a review gate.
+
+### A machine can drive all of it — MCP
+
+The whole flow, gate included, is exposed as an MCP server. Nine tools over
+`services/service.py`, which is the same module the REST routes sit on: REST and MCP
+cannot drift apart because there is nothing to drift *from*.
+
+```bash
+python mcp_server.py                            # stdio
+MCP_TRANSPORT=streamable-http python mcp_server.py
+```
+
+Point a client at it:
+
+```json
+{
+  "mcpServers": {
+    "ledger": {
+      "command": "python",
+      "args": ["mcp_server.py"],
+      "cwd": "/path/to/doctask-gyan-prakash",
+      "env": { "DATABASE_URL": "postgresql+psycopg://ledger:ledger@localhost:55432/ledger" }
+    }
+  }
+}
+```
+
+| Tool | |
 |---|---|
-| Classification confidence below threshold | Escalate to a human instead of guessing |
-| Extraction fails its schema | Retry twice with a repair prompt, then skip the document and emit a finding |
-| No conflict candidates found | Skip adjudication entirely — the honest clean path, and it costs nothing |
-| Verification fails | Loop back to compose twice, then escalate |
-| Human rejects a finding | Route back to adjudication with the feedback |
+| `start_run` | run a corpus until it completes or parks at the gate |
+| `get_run` | status, per-stage cost, and the findings awaiting a verdict |
+| **`submit_decisions`** | **the gate** — approve/reject each finding, recorded against an `actor` |
+| `get_deliverable` · `get_provenance` · `get_changes` · `get_decisions` | read the register, its sources, what moved, and every verdict |
+| `resume_interrupted_run` | continue a run whose process died |
+| `list_runs` | recent runs |
+
+`submit_decisions` takes an `actor`, so a verdict reached by a program is
+distinguishable afterwards from one reached by a person. The gate exists to put a
+responsible party behind the commit, and "approved" with no idea who approved it does
+not do that.
+
+Failures are `ToolError`, never a value. A tool returning `{"error": ...}` is
+indistinguishable from a success with unusual data to the model reading it — floor 5
+applies to this surface too.
+
+The tests drive a real `mcp.Client` over the protocol rather than calling the decorated
+functions, and one launches the server as a subprocess over stdio. Calling the
+functions would prove the service layer works, which other tests already cover, and
+would say nothing about whether a client can reach them.
+
+### Killing it, and picking it back up
+
+```bash
+curl -X POST localhost:8000/runs/<run_id>/resume
+```
+
+A run is driven by an in-process graph, so a killed process leaves a row that says
+`running` with nothing running it. At startup every such row is reclassified
+`interrupted` — an API reporting work in progress that nothing is progressing is the
+same class of untruth as a false success. Resuming re-enters the graph at the node
+after the last one that checkpointed, so completed stages are not re-paid for.
+
+If the resume itself fails — most often a source document that moved — the run goes
+back to `interrupted` rather than being left at `running`, and the response says which
+document and why. A failed rescue must not recreate the ghost it was clearing.
 
 ### The load-bearing decision
 
@@ -138,6 +214,7 @@ in the container, the working directory locally.
 
 ```
 main.py             entry point: uvicorn main:app
+mcp_server.py       the MCP surface — same service layer, no logic of its own
 api/                routers mounted by main
 services/           orchestration — the run graph, the service layer, metering, watcher
 domain/             the logic that has nothing to do with transport:
@@ -159,16 +236,34 @@ tests/              the no-key suite
 
 - **Two ingestion formats** (`.md`, `.pdf`), not five. Declared rather than discovered:
   a capability may be honestly absent, never present and broken.
-- **pgvector is insurance, not the retrieval backbone.** At this corpus size, structured
-  fact lookup beats embedding search and is deterministic enough to test properly. The
-  vector index powers one narrow fallback — "which sections might this new fact affect"
-  when exact predicate matching finds nothing. Claiming it as the retrieval story would
-  be theater.
+- **There is no vector search. pgvector is provisioned and unused.** The extension is
+  installed, `chunk.embedding` is a `vector(768)` column, and nothing writes to it or
+  reads from it. Retrieval here is structured fact lookup by predicate and vendor —
+  deterministic, exhaustive at this corpus size, and testable with no key, which
+  embedding similarity is none of.
+
+  It is called out this loudly because the schema looks like the feature exists. A
+  provisioned column is the easiest kind of thing to mistake for a working one, and
+  the stack asks for vector search, so silence here would read as a claim. If the
+  corpus grew past the point where exact predicate matching finds the affected
+  sections, the column is where that would go — but that is a plan, not a feature.
 - **Checkpointing is node-level.** Kill a node eighteen model calls deep and the graph
   resumes at the node boundary; no approved work is lost, but those calls are re-paid.
   Mitigated by keeping nodes small and putting a content-addressed cache in front of
   every model call — which is also how the "an update costs like an update" claim is
   measured rather than asserted.
+
+  A consequence worth stating: because a node can die *after* writing rows but *before*
+  its checkpoint commits, any node that writes must tolerate re-running over its own
+  partial output. `compose` clears its own run's section versions before writing for
+  exactly this reason. Nodes are not idempotent by accident, and one that isn't fails
+  the resume it was supposed to survive.
+
+- **Orphan detection assumes a single process.** At startup any run still marked
+  `running` is reclassified `interrupted`, because nothing can be in flight while the
+  only process that drives runs is still booting. Correct for the shipped deployment
+  (one uvicorn, no `--workers`); under multiple workers this needs a heartbeat, since
+  one worker booting says nothing about another's live runs.
 
 ---
 
@@ -274,6 +369,13 @@ Put a file in `inbox/` and poll:
 curl -X POST localhost:8000/watch/poll
 curl localhost:8000/runs/<run_id>/changes
 ```
+
+Or drag it onto the review page, which posts to `/documents/upload`. That endpoint
+writes into the same watched directory and triggers the same poll, so an upload and a
+file dropped into the folder converge one line apart — a second ingestion path would
+be a second thing to keep correct, and the one used less often is the one that rots.
+Uploaded filenames are reduced to their basename before anything touches disk:
+`../../x.md` is a path-traversal write, not a document.
 
 Set `WATCH_ENABLED=true` to poll on a timer instead. It is off by default: a system
 that starts spending a per-day model budget the moment it boots is one people learn to

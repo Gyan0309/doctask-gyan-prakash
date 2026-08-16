@@ -12,6 +12,11 @@ uvicorn[standard]==0.52.3
 pydantic==2.13.4
 pydantic-settings==2.15.0
 
+# Required by FastAPI to parse multipart bodies — the document upload endpoint.
+# FastAPI does not depend on it, and without it the route raises at import time
+# rather than on first request.
+python-multipart==0.0.32
+
 # psycopg MUST carry the [binary] extra.
 #
 # Plain `psycopg` installs cleanly and then fails at *import* with "no pq wrapper
@@ -31,3 +36,9 @@ langgraph-checkpoint-postgres==3.1.2
 httpx==0.28.1
 PyYAML==6.0.3
 pypdf==6.4.0
+
+# The MCP surface (mcp_server.py). Behavior 4's strongest shape, and the one SuperDocs
+# uses itself. 2.x renamed a good deal from 1.x — `MCPServer` replaces `FastMCP`,
+# fields are snake_case, and tool failures are `ToolError` while `MCPError` tears down
+# the session — so the major version here is load-bearing, not cosmetic.
+mcp==2.0.0
