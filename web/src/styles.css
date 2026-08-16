@@ -1,0 +1,259 @@
+/* Visual language borrowed from SuperDocs' own materials: a warm off-white ground,
+   near-black text, and a single coral accent used sparingly — as the short vertical
+   rule before a section heading, and nowhere else that does not need attention.
+
+   Restraint is the point. This page sits next to a document product, and a review
+   surface that shouts competes with the thing being reviewed. Almost everything here
+   is typography and whitespace; there are very few lines and no shadows. */
+
+:root {
+  --bg: #faf8f5;
+  --panel: #ffffff;
+  --ink: #16151a;
+  --muted: #77736c;
+  --faint: #a6a19a;
+  --line: #e8e4dd;
+  --accent: #e2563d;
+  --ok: #2a7d55;
+  --warn: #9a6a00;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.6 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- header ---------- */
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 28px;
+  height: 56px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+header .mark {
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+header .sub {
+  color: var(--faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+}
+
+header .spacer { flex: 1; }
+
+header .status {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* ---------- layout ---------- */
+
+.layout {
+  display: grid;
+  grid-template-columns: 232px minmax(0, 1fr) 400px;
+  height: calc(100vh - 56px);
+}
+
+@media (max-width: 1180px) {
+  .layout { grid-template-columns: 1fr; height: auto; }
+}
+
+aside {
+  background: transparent;
+  border-right: 1px solid var(--line);
+  padding: 24px 18px;
+  overflow-y: auto;
+}
+
+main {
+  padding: 28px 32px 60px;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+.detail {
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  padding: 28px 26px 60px;
+  overflow-y: auto;
+}
+
+/* ---------- headings: the coral rule ---------- */
+
+h2 {
+  position: relative;
+  font-size: 11px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  margin: 0 0 14px;
+  padding-left: 11px;
+}
+
+h2::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 2px;
+  bottom: 2px;
+  width: 3px;
+  background: var(--accent);
+  border-radius: 2px;
+}
+
+h3 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 26px 0 10px;
+  letter-spacing: -0.005em;
+}
+
+/* ---------- run list ---------- */
+
+.run {
+  padding: 9px 11px;
+  border-radius: 7px;
+  cursor: pointer;
+  margin-bottom: 2px;
+}
+.run:hover { background: #f2eee7; }
+.run.active { background: var(--panel); box-shadow: inset 0 0 0 1px var(--line); }
+.run .name {
+  font-size: 13px;
+  font-weight: 550;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.run .meta { color: var(--faint); font-size: 11.5px; margin-top: 1px; }
+
+/* ---------- register ---------- */
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+
+th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--faint);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  padding: 0 10px 8px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+td {
+  padding: 10px;
+  border-bottom: 1px solid #f2efe9;
+  vertical-align: top;
+}
+
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: #f7f4ee; }
+tr.selected td { background: #fdf1ee; }
+tr.selected td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+
+.was { color: var(--faint); font-size: 11.5px; margin-top: 2px; }
+
+/* ---------- pills ---------- */
+
+.pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 11px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  background: #f2efe9;
+}
+.pill.agreed { color: var(--ok); background: #e6f2ec; }
+.pill.unsupported, .pill.medium { color: var(--warn); background: #f7efdb; }
+.pill.high { color: var(--accent); background: #fbe8e4; }
+.pill.carried { color: var(--faint); background: transparent; box-shadow: inset 0 0 0 1px var(--line); }
+
+/* ---------- review gate ---------- */
+
+.finding {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  background: var(--panel);
+}
+.finding p { margin: 8px 0 12px; font-size: 13px; }
+
+.verdicts { display: flex; gap: 18px; font-size: 13px; }
+.verdicts label { display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--muted); }
+.verdicts input { accent-color: var(--accent); }
+
+button {
+  font: inherit;
+  font-size: 13px;
+  font-weight: 550;
+  padding: 8px 16px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+}
+button.primary { background: var(--ink); color: #fff; border-color: var(--ink); }
+button.primary:hover:not(:disabled) { background: #000; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ---------- provenance ---------- */
+
+.passage {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #3a372f;
+}
+.passage mark { background: #ffe3ba; color: var(--ink); padding: 0 2px; border-radius: 2px; }
+
+.citation { margin-bottom: 20px; }
+.citation .value { font-size: 13px; font-weight: 600; }
+
+.hash { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+
+.stat { display: flex; justify-content: space-between; font-size: 12.5px; padding: 4px 0; color: var(--muted); }
+.stat span:last-child { font-family: var(--mono); color: var(--ink); }
+
+/* ---------- states ---------- */
+
+.empty { color: var(--faint); font-size: 13px; padding: 10px 0; }
+
+.error {
+  color: #8c2f1c;
+  font-size: 13px;
+  background: #fbe8e4;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+}

@@ -14,10 +14,12 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from api.routes import router
 from database import db
@@ -222,3 +224,28 @@ def version() -> dict[str, Any]:
         "model": settings.gemini_model,
         "model_cheap": settings.gemini_model_cheap,
     }
+
+
+# ---------------------------------------------------------------------------
+# The review page, served by the API itself.
+#
+# Mounted at the very bottom of this file, and that placement is load-bearing:
+# StaticFiles with html=True answers *every* unmatched path, so mounting it before the
+# routes above are registered would swallow /runs, /health and the rest. Routes are
+# matched in registration order.
+#
+# Serving the built bundle from this process keeps `docker compose up` the one
+# documented command. A second container to serve half a dozen static files would buy
+# nothing and cost the promise that a fresh clone works in one step.
+#
+# If the bundle is absent — someone running uvicorn without building the frontend —
+# the API simply has no UI. That is an honest absence rather than a broken route.
+# ---------------------------------------------------------------------------
+
+_WEB_DIST = Path(__file__).resolve().parent / "web" / "dist"
+
+if _WEB_DIST.is_dir():
+    app.mount("/", StaticFiles(directory=_WEB_DIST, html=True), name="web")
+    log(logger, logging.INFO, "review UI mounted at /", bundle=str(_WEB_DIST))
+else:
+    log(logger, logging.INFO, "no built review UI; API only", looked_in=str(_WEB_DIST))

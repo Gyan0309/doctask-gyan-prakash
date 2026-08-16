@@ -1,3 +1,24 @@
+# --------------------------------------------------------------------------
+# Stage 1 — build the review page.
+#
+# Node exists only here. The runtime image gets the compiled bundle and nothing
+# else, so the shipped container carries no node, no node_modules, and no npm.
+# --------------------------------------------------------------------------
+FROM node:22-alpine AS web
+
+WORKDIR /web
+
+# Manifest first so a source edit does not re-resolve npm.
+COPY web/package.json web/package-lock.json* ./
+RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+COPY web/ ./
+RUN npm run build
+
+
+# --------------------------------------------------------------------------
+# Stage 2 — the application.
+# --------------------------------------------------------------------------
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -25,6 +46,10 @@ COPY utils/ ./utils/
 COPY migrations/ ./migrations/
 COPY rules/ ./rules/
 COPY tests/ ./tests/
+
+# The compiled review page. main.py mounts this at / when it exists.
+COPY --from=web /web/dist ./web/dist
+
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Strip carriage returns before making it executable.

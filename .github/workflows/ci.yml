@@ -84,12 +84,20 @@ jobs:
         # raises a BaseException subclass, so the entire suite skipped and reported
         # success. A run that skips everything and a run that passes everything look
         # identical in a summary line — so this step fails if too few tests execute.
+        #
+        # Note the absence of -q: pytest.ini already supplies it, and a second one
+        # makes -qq, which suppresses the summary line this check reads. That failed a
+        # build in which all 124 tests passed — a check that fails on success is worse
+        # than no check, because the next person learns to ignore it.
         env:
           DATABASE_URL: postgresql+psycopg://nobody:nobody@localhost:1/none
         run: |
-          pytest -m "not integration" -q --no-header | tee /tmp/unit.txt
-          grep -qE "[0-9]{2,} passed" /tmp/unit.txt || {
-            echo "expected dozens of unit tests to run without a database"; exit 1; }
+          set -o pipefail
+          pytest -m "not integration" --no-header | tee /tmp/unit.txt
+          COUNT=$(grep -oE '[0-9]+ passed' /tmp/unit.txt | head -1 | cut -d' ' -f1)
+          echo "unit tests that ran without a database: ${COUNT:-0}"
+          test "${COUNT:-0}" -ge 50 || {
+            echo "expected at least 50 unit tests to run without a database"; exit 1; }
 
       - name: Full suite
         run: pytest -v
