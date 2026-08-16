@@ -193,7 +193,9 @@ export default function ReviewGate({ runId, run, onDecided, onShowEvidence }) {
 
       <div className="gatefoot">
         <button className="primary" onClick={submit} disabled={submitting}>
-          {submitting ? "Submitting…" : `Submit ${findings.length} decisions`}
+          {submitting
+            ? "Submitting…"
+            : `Submit ${findings.length} decision${findings.length === 1 ? "" : "s"}`}
         </button>
         <span className="tally-text">
           {approved} approved, {rejected} rejected

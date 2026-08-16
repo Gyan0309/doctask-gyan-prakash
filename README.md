@@ -28,6 +28,19 @@ and which are not, rather than dying or pretending:
 curl localhost:8000/health
 ```
 
+### Give it something to read
+
+`inbox/` is gitignored, so a fresh clone starts empty. The repository ships eight
+synthetic vendor documents — an MSA, two amendments, a SOW, two invoices, a PDF and a
+renewal notice — with a deliberate overcharge and two liability breaches in them:
+
+```bash
+cp corpus/seed/* inbox/ && curl -X POST localhost:8000/watch/poll
+```
+
+Or drag them onto the page, which does the same thing. Either way the run parks at the
+human gate with its findings.
+
 To use real models instead of the deterministic offline provider:
 
 ```bash
@@ -48,7 +61,7 @@ Override with `DB_HOST_PORT` if 55432 is also taken.
 ## Tests
 
 ```bash
-pytest                      # 200 tests
+pytest                      # 224 tests
 pytest -m "not integration" # 130 of them need no database either
 ```
 
@@ -111,7 +124,7 @@ is part of the design rather than an omission:
 
 ### A machine can drive all of it — MCP
 
-The whole flow, gate included, is exposed as an MCP server. Nine tools over
+The whole flow, gate included, is exposed as an MCP server. Eleven tools over
 `services/service.py`, which is the same module the REST routes sit on: REST and MCP
 cannot drift apart because there is nothing to drift *from*.
 
@@ -141,6 +154,7 @@ Point a client at it:
 | `get_run` | status, per-stage cost, and the findings awaiting a verdict |
 | **`submit_decisions`** | **the gate** — approve/reject each finding, recorded against an `actor` |
 | `get_deliverable` · `get_provenance` · `get_changes` · `get_decisions` | read the register, its sources, what moved, and every verdict |
+| `publish_register` · `render_document` | put the register into SuperDocs as a document, or render it locally for free |
 | `resume_interrupted_run` | continue a run whose process died |
 | `list_runs` | recent runs |
 
@@ -157,6 +171,62 @@ The tests drive a real `mcp.Client` over the protocol rather than calling the de
 functions, and one launches the server as a subprocess over stdio. Calling the
 functions would prove the service layer works, which other tests already cover, and
 would say nothing about whether a client can reach them.
+
+### Built on SuperDocs — the register as an editable document
+
+The register's canonical form is ours: sectioned rows and content hashes in Postgres.
+SuperDocs is where it becomes a **document**, and where it is maintained by targeted
+edits rather than regeneration.
+
+```bash
+curl -X POST localhost:8000/runs/<run_id>/publish
+```
+
+The first publish for a corpus uploads the whole document. Every publish after that
+sends **one instruction per changed section** and approves each proposed change
+individually. That is the same claim the rest of this system makes, aimed at someone
+else's API: an update costs like an update.
+
+Measured live against `api.superdocs.app`:
+
+| | |
+|---|---|
+| First publish | 19 sections uploaded, 3 API calls |
+| Second publish, after one amendment | **1 section edited, 18 untouched** |
+| Verified against the exported document | ✅ |
+
+`session_id` is caller-chosen, so it is derived from the corpus name and used as an
+idempotency handle — republishing continues the *same document* rather than littering
+the account with near-duplicates.
+
+**Without a key it renders locally and says so** (`published: false` plus the reason)
+rather than failing. Publishing is never automatic: it is an explicitly invoked
+operation, because a run must not be able to fail because a third party is having a bad
+afternoon, and spending someone's operations budget unasked is how a system teaches
+people to distrust it.
+
+#### Two bugs this found, both of which reported success
+
+**The first live edit landed on the wrong vendor's section.** Every status code was
+200, every count was right, and the publish reported `published: true`. The cause was
+not the prompt: the register renders an agreement-level `hourly_rate` and a SOW-scoped
+one identically, so 19 sections produced **18 distinct headings** and the document had
+no unique anchor. No phrasing of "replace only this section" could have been reliable
+against it. Every section now carries a stable `[ref:…]` derived from its section key,
+and the instruction addresses that marker rather than the vendor and term.
+
+**Then the verification failed a correct edit.** `/approve` returns 200 *before* the
+change is applied — the same thing the 409 `session_busy` response tells you, applied
+to export rather than to the next instruction — so reading the document back
+immediately returns the pre-edit version. A check that fails the good case is worse
+than no check, because it teaches you to disregard the result.
+
+The lasting fix is neither of those individually: **the write path now verifies
+itself.** After publishing it re-exports the document and confirms each edited section
+carries its own value, comparing on normalised text rather than bytes (a markdown round
+trip legitimately rewrites `_` as `\_`). If a section cannot be found or does not match,
+`published` is `false` and the mismatch is named. Exports cost no operations, so the
+check is free.
 
 ### Killing it, and picking it back up
 

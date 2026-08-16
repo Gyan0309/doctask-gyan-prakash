@@ -50,6 +50,13 @@ class Settings(BaseSettings):
         "gemini-flash-lite-latest,gemini-3-flash-preview,gemini-flash-latest"
     )
 
+    # --- SuperDocs, the editing surface for the register (D5) ----------------
+    # Optional by design. Absent, the register still renders and exports locally;
+    # publishing is the only thing that becomes unavailable, and it says so rather
+    # than failing obscurely. Nothing in the test suite needs this.
+    superdocs_api_key: str | None = None
+    superdocs_base_url: str = "https://api.superdocs.app/v1"
+
     # Outbound pacing, requests per minute. Does not address the daily cap — nothing
     # can — but keeps bursts from tripping the per-minute limiter on top of it.
     gemini_requests_per_minute: int = 15

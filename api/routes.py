@@ -13,6 +13,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 import services.service as service
+from integrations.superdocs import SuperDocsError
+from services import publish
 
 router = APIRouter()
 
@@ -86,6 +88,45 @@ def resume(run_id: str) -> dict[str, Any]:
             status_code=422,
             detail=f"resume could not complete: {exc}. The run is still interrupted.",
         ) from None
+
+
+@router.post("/runs/{run_id}/publish")
+def publish_register(run_id: str, changed_only: bool = True) -> dict[str, Any]:
+    """Render the register into SuperDocs, editing only the sections that moved.
+
+    The first publish for a corpus uploads the document; every one after that sends one
+    instruction per changed section. That is the same claim the rest of the system
+    makes — an update costs like an update — made against someone else's API.
+
+    Explicitly invoked rather than run as a stage: a run must not fail because a third
+    party is unavailable, and spending someone's operations budget unasked is how a
+    system teaches people to distrust it.
+    """
+    # Each handler names a specific type. Catching bare KeyError/ValueError here
+    # reported an internal missing-field or JSON error to the caller as "no such run"
+    # or a 409 — blaming them for our fault, which is its own kind of untruth.
+    try:
+        return publish.publish(run_id, changed_only=changed_only)
+    except publish.MalformedRunId as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except publish.UnknownRun:
+        raise HTTPException(status_code=404, detail=f"no run {run_id}") from None
+    except publish.EmptyRegister as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except SuperDocsError as exc:
+        # Someone else's outage is not a 500 on our side.
+        raise HTTPException(status_code=502, detail=f"SuperDocs: {exc}") from None
+
+
+@router.get("/runs/{run_id}/document")
+def render_document(run_id: str) -> dict[str, Any]:
+    """The register rendered as a document, without touching the network."""
+    try:
+        return publish.render_only(run_id)
+    except publish.MalformedRunId as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except publish.UnknownRun:
+        raise HTTPException(status_code=404, detail=f"no run {run_id}") from None
 
 
 @router.get("/runs/{run_id}/decisions")

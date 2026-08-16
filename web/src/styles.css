@@ -205,6 +205,18 @@ h3 {
 }
 .tabs button.on .count { background: #fbe8e4; color: var(--accent); }
 
+/* ---------- publish ---------- */
+
+.register-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.register-head h2 { margin-bottom: 10px; }
+.publish button { padding: 6px 12px; font-size: 12.5px; }
+.publish .note, .publish .error { max-width: 420px; text-align: left; }
+
 /* ---------- register ---------- */
 
 table { width: 100%; border-collapse: collapse; font-size: 12.5px; }

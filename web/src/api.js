@@ -51,6 +51,10 @@ export const pollWatch = () => request("/watch/poll", { method: "POST" });
 // Continue a run whose process died, from its last checkpoint.
 export const resumeRun = (runId) => request(`/runs/${runId}/resume`, { method: "POST" });
 
+// Render the register into SuperDocs, editing only the sections that moved.
+export const publishRegister = (runId) =>
+  request(`/runs/${runId}/publish`, { method: "POST" });
+
 // No Content-Type: the browser must set it itself to include the multipart boundary,
 // and naming it here produces a body the server cannot parse.
 export const uploadDocuments = (fileList) => {

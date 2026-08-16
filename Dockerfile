@@ -39,6 +39,8 @@ COPY main.py ./
 COPY api/ ./api/
 COPY database/ ./database/
 COPY domain/ ./domain/
+COPY integrations/ ./integrations/
+COPY mcp_server.py ./
 COPY models/ ./models/
 COPY providers/ ./providers/
 COPY services/ ./services/

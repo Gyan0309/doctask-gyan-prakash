@@ -10,7 +10,20 @@ function humanize(corpus) {
 
 export default function RunList({ runs, activeId, onSelect }) {
   if (!runs.length) {
-    return <p className="empty">No runs yet. Start one with POST /runs, or drop a document into the watched folder.</p>;
+    // The first thing a new arrival reads, and `inbox/` is gitignored — so on a fresh
+    // clone they have no documents and nowhere obvious to get one. Naming the seed
+    // corpus is the difference between a working system and a working system nobody
+    // can start.
+    return (
+      <div className="empty">
+        <p style={{ margin: "0 0 8px" }}>No runs yet.</p>
+        <p style={{ margin: 0 }}>
+          Drop a contract above — or try the eight synthetic ones in{" "}
+          <code>corpus/seed/</code>, which contain a deliberate overcharge and a
+          liability breach to find.
+        </p>
+      </div>
+    );
   }
 
   return (

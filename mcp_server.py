@@ -35,7 +35,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from database.config import get_settings
-from services import service
+from integrations.superdocs import SuperDocsError
+from services import publish, service
 from utils.logging_config import configure_logging, get_logger, log
 
 _settings = get_settings()
@@ -265,6 +266,43 @@ def submit_decisions(
     except Exception as exc:
         log(logger, logging.ERROR, "mcp submit_decisions failed", error=type(exc).__name__)
         raise _fail(f"{type(exc).__name__}: {exc}") from None
+
+
+@server.tool()
+def publish_register(
+    run_id: Annotated[str, Field(description="The run's UUID.")],
+    changed_only: Annotated[
+        bool,
+        Field(description="Edit only sections that moved. False forces a full re-upload."),
+    ] = True,
+) -> dict[str, Any]:
+    """Publish this run's register to SuperDocs as an editable document.
+
+    The first publish for a corpus uploads the whole document; every one after that
+    sends one targeted edit per **changed** section and approves each individually,
+    leaving untouched sections untouched. An update costs like an update.
+
+    This spends SuperDocs operations, so it is never automatic — it happens only when
+    called. Without a key configured it returns the locally rendered document with
+    `published: false` and the reason, rather than failing.
+    """
+    try:
+        return publish.publish(run_id, changed_only=changed_only)
+    except (publish.MalformedRunId, publish.UnknownRun, publish.EmptyRegister) as exc:
+        raise _fail(str(exc) or f"no run {run_id}", invalid_params=True) from None
+    except SuperDocsError as exc:
+        raise _fail(f"SuperDocs: {exc}") from None
+
+
+@server.tool()
+def render_document(
+    run_id: Annotated[str, Field(description="The run's UUID.")],
+) -> dict[str, Any]:
+    """The register rendered as a markdown document, with no network call and no cost."""
+    try:
+        return publish.render_only(run_id)
+    except (publish.MalformedRunId, publish.UnknownRun) as exc:
+        raise _fail(str(exc) or f"no run {run_id}", invalid_params=True) from None
 
 
 @server.tool()

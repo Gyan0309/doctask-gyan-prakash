@@ -156,6 +156,7 @@ export default function App() {
             />
           ) : (
             <Register
+              runId={runId}
               deliverable={deliverable}
               changes={changes}
               selectedKey={selectedSection}

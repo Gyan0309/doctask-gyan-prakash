@@ -9,7 +9,9 @@
  * incrementality claim, and it is worth seeing beside the values rather than only in a
  * summary.
  */
-export default function Register({ deliverable, changes, selectedKey, onSelect }) {
+import Publish from "./Publish.jsx";
+
+export default function Register({ runId, deliverable, changes, selectedKey, onSelect }) {
   if (!deliverable) return null;
 
   const sections = deliverable.sections ?? [];
@@ -25,7 +27,10 @@ export default function Register({ deliverable, changes, selectedKey, onSelect }
 
   return (
     <section>
-      <h2>Register</h2>
+      <div className="register-head">
+        <h2>Register</h2>
+        <Publish runId={runId} />
+      </div>
       {deliverable.carried_forward > 0 && (
         <p className="empty" style={{ marginTop: -8, marginBottom: 12 }}>
           {deliverable.carried_forward} rows carried forward untouched ·{" "}
