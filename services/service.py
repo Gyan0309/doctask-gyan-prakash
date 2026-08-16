@@ -167,6 +167,20 @@ def start_run(
             thread_id=thread_id or run_id,
         )
         with timed(logger, "run", run_id=run_id):
+            # `durability="sync"` is not the default, and behavior 2 does not survive
+            # the default.
+            #
+            # LangGraph persists checkpoints asynchronously unless told otherwise: the
+            # next node starts while the previous one's checkpoint is still being
+            # written. SIGKILL then takes whatever had not landed, and how much that is
+            # depends on how fast the machine is — the same kill left CI resumable at
+            # `compose` and a developer laptop resumable at `ingest`, having thrown away
+            # four stages that had already run and already been metered.
+            #
+            # "Resumes at the last node boundary" is the floor. A boundary that only
+            # usually survives is not one, and the failure is invisible: the run does
+            # finish, just by re-doing work it claims not to re-do. Sync costs one
+            # round-trip per node on a twelve-node graph.
             state = graph.invoke(
                 {
                     "run_id": run_id,
@@ -175,6 +189,7 @@ def start_run(
                     "document_paths": [str(p) for p in document_paths],
                 },
                 config,
+                durability="sync",
             )
 
         result = _describe(run_id, state, config)
@@ -212,7 +227,13 @@ def resume_run(
             # decisions in a dict that always has keys makes the resume value truthy
             # by construction.
             state = graph.invoke(
-                Command(resume={"decisions": decisions, "actor": actor}), config
+                Command(resume={"decisions": decisions, "actor": actor}),
+                config,
+                # Same reason as `start_run`. A reviewer's verdicts are the least
+                # reproducible thing in the system — nothing re-derives them — so the
+                # node that records them is the last one that should be checkpointed on
+                # a best-effort basis.
+                durability="sync",
             )
         return _describe(run_id, state, config)
 
@@ -280,7 +301,10 @@ def resume_interrupted(run_id: str) -> dict[str, Any]:
         log(logger, logging.INFO, "resuming interrupted run from its last checkpoint")
         try:
             with timed(logger, "resume_interrupted", run_id=run_id):
-                state = graph.invoke(None, config)
+                # Same reason as `start_run`, and it matters most here: a resumed run is
+                # one that has already been killed once, and there is no reason to
+                # assume it will not be killed again mid-recovery.
+                state = graph.invoke(None, config, durability="sync")
         except Exception as exc:
             # Put the run back where it was. Without this a failed resume leaves the
             # row saying `running` — recreating exactly the ghost this operation exists

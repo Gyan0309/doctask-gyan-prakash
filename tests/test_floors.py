@@ -25,6 +25,7 @@ from sqlalchemy.engine import Engine
 import services.service as service
 from database.db import session_scope
 from models import Decision, Fact, Finding, Run, SectionVersion, StageMetric
+from services.graph import build_graph
 
 pytestmark = pytest.mark.integration
 
@@ -149,18 +150,21 @@ KILL_SCRIPT = textwrap.dedent(
     import services.service as service
 
     corpus, path, marker = sys.argv[1], sys.argv[2], sys.argv[3]
+    # Which node the process dies in. Defaults to `compose`, deep enough that several
+    # stages have finished and their loss would be visible.
+    victim = sys.argv[4] if len(sys.argv) > 4 else "compose"
 
     # Kill the process the moment the named stage completes. Killing *between* stages
     # is the honest test: LangGraph checkpoints at node boundaries, so this is exactly
     # the seam a real crash lands on.
     import services.graph as g
-    _real = g.compose
+    _real = getattr(g, victim)
     def _die(state):
         out = _real(state)
         open(marker, "w").write(state["run_id"])
         os.kill(os.getpid(), 9)
         return out
-    g.compose = _die
+    setattr(g, victim, _die)
     g.build_graph.cache_clear() if hasattr(g.build_graph, "cache_clear") else None
 
     service.start_run(corpus_name=corpus, document_paths=[path])
@@ -284,6 +288,70 @@ class TestFloorTwoSurvivesBeingKilled:
 
         assert service.get_run(killed_run_id)["status"] == "interrupted"
 
+    def test_the_kill_leaves_a_checkpoint_at_the_stage_it_died_in(
+        self, tmp_path, database_url
+    ) -> None:
+        """Every stage that finished before the kill must be *durably* checkpointed.
+
+        The other tests in this class all pass even when this is false, because a run
+        that silently restarts from the beginning still finishes, and the model cache
+        still makes it cheap. So they assert on the outcome and this one asserts on the
+        seam: the surviving checkpoint has to point at the node that was interrupted,
+        not at some earlier one whose successors were lost.
+
+        Written after the real thing happened. LangGraph persists asynchronously by
+        default, so the kill took four stages that had already run and already been
+        metered, and how many it took varied by machine — the same test resumed at
+        `compose` in CI and at `ingest` locally. `durability="sync"` in the service
+        layer is what this holds down.
+        """
+        source = tmp_path / "msa.md"
+        source.write_text(MSA, encoding="utf-8")
+        marker = tmp_path / "run_id.txt"
+        script = tmp_path / "kill.py"
+        script.write_text(KILL_SCRIPT, encoding="utf-8")
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                _unique("floor2-boundary"),
+                str(source),
+                str(marker),
+            ],
+            cwd=os.getcwd(),
+            env={
+                **os.environ,
+                "DATABASE_URL": database_url,
+                "LLM_PROVIDER": "fake",
+                "LOG_LEVEL": "WARNING",
+                "PYTHONPATH": ".",
+            },
+            capture_output=True,
+            timeout=180,
+        )
+        assert marker.exists(), (
+            f"the child never reached the kill point; stderr:\n"
+            f"{proc.stderr.decode()[-2000:]}"
+        )
+        killed_run_id = marker.read_text().strip()
+
+        snapshot = build_graph(service.get_checkpointer()).get_state(
+            {"configurable": {"thread_id": killed_run_id}}
+        )
+
+        assert snapshot.next == ("compose",), (
+            "the run died in compose, so the last durable checkpoint must be the one "
+            f"that hands over to it; the graph would restart at {snapshot.next} and "
+            "re-run stages that had already finished"
+        )
+        # And the state at that boundary carries the work, not just the position in the
+        # graph — extraction is the expensive stage, and it ran before the kill.
+        assert snapshot.values.get("fact_ids"), (
+            f"checkpoint kept the position but lost the facts; values="
+            f"{sorted(snapshot.values)}"
+        )
+
     def test_an_interrupted_run_resumes_from_its_own_checkpoint(
         self, tmp_path, database_url
     ) -> None:
@@ -332,7 +400,14 @@ class TestFloorTwoSurvivesBeingKilled:
         """Resuming sets the run back to `running`. If the attempt then dies — the
         usual cause being a source document that has since moved — that status must not
         be what it is left with, or the failed rescue recreates the exact stuck row it
-        was meant to clear."""
+        was meant to clear.
+
+        Killed in `ingest` specifically, because that is the only node that reads the
+        source file: the resume re-enters the node that was interrupted, so a test that
+        deletes the document has to kill the run *in* the stage that opens it. Killing
+        deeper leaves a run that resumes past ingestion and finishes happily from the
+        chunks already in the database — correct behavior, and no test of this at all.
+        """
         source = tmp_path / "msa.md"
         source.write_text(MSA, encoding="utf-8")
         marker = tmp_path / "run_id.txt"
@@ -340,7 +415,14 @@ class TestFloorTwoSurvivesBeingKilled:
         script.write_text(KILL_SCRIPT, encoding="utf-8")
 
         subprocess.run(
-            [sys.executable, str(script), _unique("floor2-lost"), str(source), str(marker)],
+            [
+                sys.executable,
+                str(script),
+                _unique("floor2-lost"),
+                str(source),
+                str(marker),
+                "ingest",
+            ],
             cwd=os.getcwd(),
             env={
                 **os.environ,

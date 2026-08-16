@@ -170,6 +170,16 @@ A run is driven by an in-process graph, so a killed process leaves a row that sa
 same class of untruth as a false success. Resuming re-enters the graph at the node
 after the last one that checkpointed, so completed stages are not re-paid for.
 
+That last sentence is only true because the graph is invoked with `durability="sync"`,
+which is not LangGraph's default. The default persists checkpoints asynchronously — the
+next node starts while the previous one's checkpoint is still being written — so a
+`kill -9` takes whatever had not landed, and how much that is depends on how fast the
+machine is. The same kill left CI resumable at `compose` and a laptop resumable at
+`ingest`, four already-metered stages thrown away. Nothing caught it for a while
+because the resumed run still *finishes*; it just quietly re-does the work this section
+says it does not. `test_the_kill_leaves_a_checkpoint_at_the_stage_it_died_in` asserts on
+the seam rather than the outcome, which is what it takes to see the difference.
+
 If the resume itself fails — most often a source document that moved — the run goes
 back to `interrupted` rather than being left at `running`, and the response says which
 document and why. A failed rescue must not recreate the ghost it was clearing.
