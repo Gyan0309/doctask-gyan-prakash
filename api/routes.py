@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from ledger import service
+import services.service as service
 
 router = APIRouter()
 
@@ -44,6 +44,12 @@ def start_run(request: StartRunRequest) -> dict[str, Any]:
     )
 
 
+@router.get("/runs")
+def list_runs(limit: int = 25) -> list[dict[str, Any]]:
+    """Recent runs, newest first."""
+    return service.list_runs(limit=limit)
+
+
 @router.get("/runs/{run_id}")
 def get_run(run_id: str) -> dict[str, Any]:
     try:
@@ -65,6 +71,22 @@ def list_decisions(run_id: str) -> list[dict[str, Any]]:
 @router.get("/runs/{run_id}/deliverable")
 def get_deliverable(run_id: str) -> dict[str, Any]:
     return service.get_deliverable(run_id)
+
+
+@router.get("/runs/{run_id}/provenance")
+def get_provenance(run_id: str, section_key: str) -> dict[str, Any]:
+    """Where a register row's value came from: document, passage, character span.
+
+    The endpoint behind "click a value and see the sentence it was read from". A
+    register that cannot answer this is asking to be trusted; one that can is asking
+    to be checked.
+    """
+    try:
+        return service.get_provenance(run_id, section_key)
+    except KeyError:
+        raise HTTPException(
+            status_code=404, detail=f"no section {section_key!r} in run {run_id}"
+        ) from None
 
 
 @router.get("/runs/{run_id}/changes")

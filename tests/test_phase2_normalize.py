@@ -13,14 +13,14 @@ from uuid import uuid4
 
 import pytest
 
-from ledger.domain.normalize import (
+from domain.normalize import (
     normalize,
     normalize_date,
     normalize_days,
     normalize_money,
     normalize_months,
 )
-from ledger.domain.reconcile import FactView, governing_value_at, reconcile
+from domain.reconcile import FactView, governing_value_at, reconcile
 
 
 class TestMoney:
@@ -57,7 +57,7 @@ class TestMoney:
         """The regression that mattered. Extraction returns bare magnitudes, so any
         numeric predicate that cannot accept one is silently excluded from conflict
         detection — the failure is invisible until you notice the register is thin."""
-        from ledger.domain.normalize import (
+        from domain.normalize import (
             DAY_PREDICATES,
             MONEY_PREDICATES,
             MONTH_PREDICATES,

@@ -25,8 +25,8 @@ from typing import Any
 
 import yaml
 
-from ledger.domain.normalize import normalize
-from ledger.domain.reconcile import Resolution
+from domain.normalize import normalize
+from domain.reconcile import Resolution
 
 RULE_KINDS = {"numeric_max", "numeric_min", "numeric_bound", "presence_required"}
 SEVERITIES = {"low", "medium", "high"}

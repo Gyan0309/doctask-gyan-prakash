@@ -13,9 +13,9 @@ from typing import Any
 
 import httpx
 
-from ledger.logging_config import get_logger, log
-from ledger.providers.base import Completion, ModelProvider, ProviderError
-from ledger.providers.ratelimit import get_limiter
+from providers.base import Completion, ModelProvider, ProviderError
+from providers.ratelimit import get_limiter
+from utils.logging_config import get_logger, log
 
 logger = get_logger(__name__)
 

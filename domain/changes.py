@@ -24,7 +24,7 @@ from uuid import UUID
 
 from sqlalchemy import select
 
-from ledger.models import (
+from models import (
     Claim,
     ClaimCitation,
     Document,

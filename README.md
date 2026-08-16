@@ -132,15 +132,24 @@ affordable, and it keeps hardcoded special cases from wearing intelligence as a 
 
 ## Project layout
 
+Packages sit flat at the repository root and are imported directly (`from domain.rules
+import evaluate`). There is no build step and nothing to pip-install — `PYTHONPATH=/app`
+in the container, the working directory locally.
+
 ```
-src/ledger/
-  config.py         all environment-driven configuration, model IDs included
-  models.py         the schema; three tables carry the invariants
-  db.py             engine and transactional session scope
-  providers/        model provider interface + Gemini + a deterministic offline stub
-  api/              FastAPI surface
-migrations/         Alembic; the initial migration creates the vector extension itself
+main.py             entry point: uvicorn main:app
+api/                routers mounted by main
+services/           orchestration — the run graph, the service layer, metering, watcher
+domain/             the logic that has nothing to do with transport:
+                      classify · extract · normalize · reconcile
+                      conflicts · adjudicate · rules · verify · compose · changes
+models/             ORM tables; three of them carry the invariants
+database/           engine, session scope, and application configuration
+providers/          model provider interface + Gemini + a deterministic offline stub
+utils/              hashing and logging configuration
+migrations/         Alembic; the first migration creates the vector extension itself
 rules/playbook.yaml the contract rules — adding a rule is a data change
+corpus/seed/        the synthetic vendor documents
 tests/              the no-key suite
 ```
 

@@ -9,9 +9,9 @@ import json
 
 import pytest
 
-from ledger.config import Settings
-from ledger.providers import FakeProvider, build_provider
-from ledger.providers.base import ProviderError
+from database.config import Settings
+from providers import FakeProvider, build_provider
+from providers.base import ProviderError
 
 
 def test_provider_is_selected_by_configuration_not_code() -> None:

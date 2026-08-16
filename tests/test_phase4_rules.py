@@ -14,8 +14,8 @@ from uuid import uuid4
 
 import pytest
 
-from ledger.domain.reconcile import FactView, reconcile
-from ledger.domain.rules import (
+from domain.reconcile import FactView, reconcile
+from domain.rules import (
     RuleError,
     evaluate,
     evaluate_expression,

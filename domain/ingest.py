@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from ledger.hashing import bytes_hash
+from utils.hashing import bytes_hash
 
 # Declared, supported formats. A capability may be honestly absent from this list;
 # it may never be present and broken.

@@ -20,12 +20,24 @@ from psycopg_pool import ConnectionPool
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from ledger.config import get_settings
-from ledger.db import session_scope
-from ledger.domain.changes import build_ledger
-from ledger.graph import build_graph
-from ledger.logging_config import get_logger, log, run_context, timed
-from ledger.models import Corpus, Decision, Finding, Run, SectionVersion, StageMetric
+from database.config import get_settings
+from database.db import session_scope
+from domain.changes import build_ledger
+from models import (
+    Chunk,
+    Claim,
+    ClaimCitation,
+    Corpus,
+    Decision,
+    Document,
+    Fact,
+    Finding,
+    Run,
+    SectionVersion,
+    StageMetric,
+)
+from services.graph import build_graph
+from utils.logging_config import get_logger, log, run_context, timed
 
 logger = get_logger(__name__)
 
@@ -321,6 +333,96 @@ def get_changes(run_id: str) -> dict[str, Any]:
                 }
                 for change in ledger.changes
             ],
+        }
+
+
+def list_runs(limit: int = 25) -> list[dict[str, Any]]:
+    """Recent runs, newest first — what a reviewer lands on."""
+    with session_scope() as session:
+        rows = session.execute(
+            select(Run, Corpus.name)
+            .join(Corpus, Corpus.id == Run.corpus_id)
+            .order_by(Run.started_at.desc())
+            .limit(limit)
+        ).all()
+
+        return [
+            {
+                "run_id": str(run.id),
+                "corpus": corpus_name,
+                "status": run.status,
+                "mode": run.mode,
+                "started_at": run.started_at.isoformat(),
+                "ended_at": run.ended_at.isoformat() if run.ended_at else None,
+            }
+            for run, corpus_name in rows
+        ]
+
+
+def get_provenance(run_id: str, section_key: str) -> dict[str, Any]:
+    """Where a register row's value actually came from.
+
+    This is I1 made visible. The register asserts "the hourly rate is $195"; this
+    returns the document, the exact sentence, and the character span it was read from —
+    so a reviewer can check the claim rather than trust it.
+
+    Returning the surrounding chunk text as well as the quote is deliberate: a quote on
+    its own is easy to agree with, and the point of provenance is to let someone
+    disagree.
+    """
+    with session_scope() as session:
+        version = session.execute(
+            select(SectionVersion).where(
+                SectionVersion.run_id == UUID(run_id),
+                SectionVersion.section_key == section_key,
+            )
+        ).scalar_one_or_none()
+
+        if version is None:
+            raise KeyError(f"{section_key} in run {run_id}")
+
+        claims = session.execute(
+            select(Claim).where(Claim.section_version_id == version.id)
+        ).scalars().all()
+
+        cited = []
+        for claim in claims:
+            rows = session.execute(
+                select(Fact, Document, Chunk)
+                .join(ClaimCitation, ClaimCitation.fact_id == Fact.id)
+                .join(Document, Document.id == Fact.document_id)
+                .outerjoin(Chunk, Chunk.id == Fact.chunk_id)
+                .where(ClaimCitation.claim_id == claim.id)
+            ).all()
+
+            for fact, document, chunk in rows:
+                cited.append(
+                    {
+                        "fact_id": str(fact.id),
+                        "predicate": fact.predicate,
+                        "value": fact.value_raw,
+                        "effective_date": (
+                            fact.effective_date.isoformat() if fact.effective_date else None
+                        ),
+                        "document": Path(document.uri).name,
+                        "document_kind": document.kind,
+                        "confidence": fact.confidence,
+                        # The passage itself. Without it a citation is a filename, and a
+                        # filename proves nothing.
+                        "passage": chunk.text if chunk else None,
+                        "char_start": chunk.char_start if chunk else None,
+                        "char_end": chunk.char_end if chunk else None,
+                    }
+                )
+
+        return {
+            "run_id": run_id,
+            "section_key": section_key,
+            "content": version.content,
+            "content_hash": version.content_hash,
+            "carried_forward": version.carried_forward,
+            "claims": [{"text": c.text, "status": c.status} for c in claims],
+            "citations": cited,
         }
 
 

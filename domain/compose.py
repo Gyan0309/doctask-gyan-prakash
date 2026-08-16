@@ -23,8 +23,8 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ledger.hashing import content_hash, stable_json
-from ledger.models import Claim, ClaimCitation, SectionDependency, SectionVersion
+from models import Claim, ClaimCitation, SectionDependency, SectionVersion
+from utils.hashing import content_hash, stable_json
 
 
 @dataclass(frozen=True)

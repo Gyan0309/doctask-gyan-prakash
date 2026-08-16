@@ -11,9 +11,9 @@ import json
 
 import pytest
 
-from ledger.domain.classify import KIND_PRECEDENCE, classify_document
-from ledger.graph import route_after_classify
-from ledger.providers.fake import FakeProvider
+from domain.classify import KIND_PRECEDENCE, classify_document
+from providers.fake import FakeProvider
+from services.graph import route_after_classify
 
 
 class _Client:
@@ -96,7 +96,7 @@ class TestRouting:
 
     def test_the_escalate_node_exists_in_the_compiled_graph(self) -> None:
         """Routing to a node that was never added fails at runtime, not at import."""
-        from ledger.graph import build_graph
+        from services.graph import build_graph
 
         nodes = set(build_graph().get_graph().nodes)
         assert {"classify", "escalate", "extract"} <= nodes

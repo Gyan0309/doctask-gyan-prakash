@@ -1,9 +1,12 @@
-"""FastAPI application.
+"""Application entry point.
 
-Phase 0 exposes only what proves the system is alive and correctly wired. The run,
-decision and deliverable endpoints from DESIGN.md §8 arrive with the stages that back
-them — an endpoint that returns a plausible shape backed by nothing is the "present
-and broken" failure the brief calls out, and is worse than an honestly absent route.
+`uvicorn main:app` — the FastAPI instance, its middleware, the health and watch
+endpoints, and the startup wiring. Everything with real logic lives behind it:
+`api/` holds the routers, `services/` the orchestration, `domain/` the rules.
+
+An endpoint that returns a plausible shape backed by nothing is the "present and
+broken" failure the brief calls out, and is worse than an honestly absent route — so
+routes appear here only once the stages behind them exist.
 """
 
 from __future__ import annotations
@@ -16,13 +19,14 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from ledger import db, service
-from ledger.api.routes import router
-from ledger.config import get_settings
-from ledger.logging_config import configure_logging, get_logger, log, run_context
-from ledger.providers import build_provider
-from ledger.providers.base import ProviderError
-from ledger.watcher import Watcher
+from api.routes import router
+from database import db
+from database.config import get_settings
+from providers import build_provider
+from providers.base import ProviderError
+from services import service
+from services.watcher import Watcher
+from utils.logging_config import configure_logging, get_logger, log, run_context
 
 _settings = get_settings()
 configure_logging(_settings.log_level, _settings.log_format)

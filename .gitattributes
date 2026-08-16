@@ -1,0 +1,24 @@
+# Line endings are normalised to LF in the repository, and checked out as LF.
+#
+# This is not tidiness. Without it, a clone on Windows with the default
+# core.autocrlf=true rewrites every text file to CRLF on checkout — including
+# docker/entrypoint.sh, whose shebang then reads `#!/usr/bin/env bash\r`. The Linux
+# container looks for a program literally named "bash\r", the API exits 127 before
+# printing anything useful, and `docker compose up` — the one documented command —
+# fails on a fresh clone while working perfectly in the repository it was built in.
+#
+# Caught by cloning the repo and running it as a reviewer would, not by any test.
+
+* text=auto eol=lf
+
+# Belt and braces for the files where CRLF is actively fatal rather than merely untidy.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+Dockerfile text eol=lf
+
+# Binary, never touched.
+*.pdf   binary
+*.png   binary
+*.jpg   binary

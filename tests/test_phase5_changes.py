@@ -19,9 +19,9 @@ import uuid
 import pytest
 from sqlalchemy.engine import Engine
 
-from ledger import service
-from ledger.db import session_scope
-from ledger.domain.changes import build_ledger
+import services.service as service
+from database.db import session_scope
+from domain.changes import build_ledger
 
 pytestmark = pytest.mark.integration
 

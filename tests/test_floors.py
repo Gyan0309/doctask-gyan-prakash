@@ -22,9 +22,9 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from ledger import service
-from ledger.db import session_scope
-from ledger.models import Decision, Fact, Finding, Run, SectionVersion, StageMetric
+import services.service as service
+from database.db import session_scope
+from models import Decision, Fact, Finding, Run, SectionVersion, StageMetric
 
 pytestmark = pytest.mark.integration
 
@@ -145,15 +145,15 @@ class TestFloorOneDecisionsChangeThePath:
 KILL_SCRIPT = textwrap.dedent(
     """
     import os, sys, json
-    sys.path.insert(0, "src")
-    from ledger import service
+    sys.path.insert(0, ".")
+    import services.service as service
 
     corpus, path, marker = sys.argv[1], sys.argv[2], sys.argv[3]
 
     # Kill the process the moment the named stage completes. Killing *between* stages
     # is the honest test: LangGraph checkpoints at node boundaries, so this is exactly
     # the seam a real crash lands on.
-    import ledger.graph as g
+    import services.graph as g
     _real = g.compose
     def _die(state):
         out = _real(state)
@@ -190,7 +190,7 @@ class TestFloorTwoSurvivesBeingKilled:
             "DATABASE_URL": database_url,
             "LLM_PROVIDER": "fake",
             "LOG_LEVEL": "WARNING",
-            "PYTHONPATH": "src",
+            "PYTHONPATH": ".",
         }
         corpus = _unique("floor2")
 

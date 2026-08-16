@@ -17,9 +17,9 @@ import json
 import logging
 from dataclasses import dataclass
 
-from ledger.domain.ingest import RawChunk
-from ledger.logging_config import get_logger, log
-from ledger.metering import MeteredClient
+from domain.ingest import RawChunk
+from services.metering import MeteredClient
+from utils.logging_config import get_logger, log
 
 logger = get_logger(__name__)
 

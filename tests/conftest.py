@@ -34,7 +34,7 @@ def _offline_by_default() -> None:
     os.environ["LLM_PROVIDER"] = "fake"
     os.environ.setdefault("DATABASE_URL", DEFAULT_TEST_DB)
 
-    from ledger.config import get_settings
+    from database.config import get_settings
 
     get_settings.cache_clear()
 

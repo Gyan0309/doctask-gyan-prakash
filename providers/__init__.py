@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from ledger.config import Settings, get_settings
-from ledger.providers.base import Completion, ModelProvider, ProviderError
-from ledger.providers.fake import FakeProvider
-from ledger.providers.gemini import GeminiProvider
+from database.config import Settings, get_settings
+from providers.base import Completion, ModelProvider, ProviderError
+from providers.fake import FakeProvider
+from providers.gemini import GeminiProvider
 
 __all__ = [
     "Completion",

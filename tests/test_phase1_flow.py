@@ -15,7 +15,7 @@ import uuid
 import pytest
 from sqlalchemy.engine import Engine
 
-from ledger import service
+import services.service as service
 
 pytestmark = pytest.mark.integration
 

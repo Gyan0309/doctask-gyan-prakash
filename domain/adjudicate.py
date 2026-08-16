@@ -20,9 +20,9 @@ import json
 import logging
 from dataclasses import dataclass
 
-from ledger.domain.conflicts import ConflictCandidate
-from ledger.logging_config import get_logger, log
-from ledger.metering import MeteredClient
+from domain.conflicts import ConflictCandidate
+from services.metering import MeteredClient
+from utils.logging_config import get_logger, log
 
 logger = get_logger(__name__)
 

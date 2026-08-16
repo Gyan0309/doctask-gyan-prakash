@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app
 
 WORKDIR /app
 
@@ -10,14 +11,31 @@ WORKDIR /app
 COPY requirements.txt requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
 
-COPY pyproject.toml alembic.ini ./
-COPY src/ ./src/
+# Packages live flat at the repository root, so they are copied as they are and
+# imported directly. PYTHONPATH=/app is what makes that work; there is no build step.
+COPY pytest.ini pyproject.toml alembic.ini ./
+COPY main.py ./
+COPY api/ ./api/
+COPY database/ ./database/
+COPY domain/ ./domain/
+COPY models/ ./models/
+COPY providers/ ./providers/
+COPY services/ ./services/
+COPY utils/ ./utils/
 COPY migrations/ ./migrations/
 COPY rules/ ./rules/
 COPY tests/ ./tests/
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
-RUN pip install --no-deps -e . && chmod +x /usr/local/bin/entrypoint.sh
+# Strip carriage returns before making it executable.
+#
+# `.gitattributes` already forces LF on checkout, and this makes the image immune even
+# if the file arrives with CRLF some other way — a zip download, a copy off a Windows
+# share, an editor that helpfully "fixed" it. Without one of these two layers the
+# shebang becomes `#!/usr/bin/env bash\r`, the container looks for a program named
+# "bash\r", and the API exits 127 with a message that names bash rather than the file.
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh \
+    && chmod +x /usr/local/bin/entrypoint.sh
 
 # Non-root. Nothing here needs privilege, and a container that runs as root by
 # default is a habit that costs nothing to break now and a lot to break later.
@@ -28,4 +46,4 @@ USER ledger
 EXPOSE 8000
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["uvicorn", "ledger.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

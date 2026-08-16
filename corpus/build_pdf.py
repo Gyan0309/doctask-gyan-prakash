@@ -78,7 +78,7 @@ def _escape(text: str) -> str:
 
 
 def _content_stream(lines: list[str]) -> bytes:
-    parts = ["BT", f"/F1 11 Tf", f"{LEADING} TL", f"1 0 0 1 {MARGIN_LEFT} {MARGIN_TOP} Tm"]
+    parts = ["BT", "/F1 11 Tf", f"{LEADING} TL", f"1 0 0 1 {MARGIN_LEFT} {MARGIN_TOP} Tm"]
     for line in lines:
         # Tj draws, T* advances — so an empty line still moves the cursor down.
         parts.append(f"({_escape(line)}) Tj" if line else "()Tj")

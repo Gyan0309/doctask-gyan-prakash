@@ -21,7 +21,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from ledger.providers.base import Completion, ModelProvider, ProviderError
+from providers.base import Completion, ModelProvider, ProviderError
 
 # Phrases that mark text aimed at an automated reader. Deliberately literal: this
 # stub stands in for a model's judgement, and pretending it has judgement it does not

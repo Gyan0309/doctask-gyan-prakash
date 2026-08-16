@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import json
 
-from ledger.domain.extract import build_prompt, extract_from_document, resolve_citation
-from ledger.domain.ingest import RawChunk, chunk_text
-from ledger.providers.fake import FakeProvider
+from domain.extract import build_prompt, extract_from_document, resolve_citation
+from domain.ingest import RawChunk, chunk_text
+from providers.fake import FakeProvider
 
 
 def _chunk(text: str, start: int = 0) -> RawChunk:
@@ -225,7 +225,7 @@ class TestInjectionDefence:
     def test_output_schema_has_no_field_that_could_carry_an_instruction(self) -> None:
         """Layer 2. Even a fooled model cannot express an instruction through this
         path, because the schema has nowhere to put one."""
-        from ledger.domain.extract import EXTRACTION_SCHEMA
+        from domain.extract import EXTRACTION_SCHEMA
 
         fact_fields = set(
             EXTRACTION_SCHEMA["properties"]["facts"]["items"]["properties"]

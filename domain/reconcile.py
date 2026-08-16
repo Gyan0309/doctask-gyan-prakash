@@ -29,7 +29,7 @@ from datetime import date
 from decimal import Decimal
 from uuid import UUID
 
-from ledger.domain.classify import KIND_PRECEDENCE
+from domain.classify import KIND_PRECEDENCE
 
 # Kinds whose terms bind only their own engagement, not the agreement as a whole.
 SCOPED_KINDS = {"sow"}

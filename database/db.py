@@ -10,8 +10,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from ledger.config import get_settings
-from ledger.logging_config import get_logger, log
+from database.config import get_settings
+from utils.logging_config import get_logger, log
 
 logger = get_logger(__name__)
 

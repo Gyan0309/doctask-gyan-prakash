@@ -65,7 +65,7 @@ def verify_run(session, run_id: UUID) -> VerificationReport:
     """
     from sqlalchemy import select
 
-    from ledger.models import Chunk, Claim, ClaimCitation, Document, Fact, SectionVersion
+    from models import Chunk, Claim, ClaimCitation, Document, Fact, SectionVersion
 
     report = VerificationReport()
 

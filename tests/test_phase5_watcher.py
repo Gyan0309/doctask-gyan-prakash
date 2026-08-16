@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ledger.watcher import Watcher, WatchState, list_documents, poll_once
+from services.watcher import Watcher, WatchState, list_documents, poll_once
 
 
 class _Recorder:

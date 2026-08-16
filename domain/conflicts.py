@@ -25,8 +25,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from ledger.domain.normalize import normalize
-from ledger.domain.reconcile import FactView, governing_value_at
+from domain.normalize import normalize
+from domain.reconcile import FactView, governing_value_at
 
 # What each comparator is for, in one line, because these strings surface in the UI.
 # Which governing term an observational predicate is evidence *about*.

@@ -12,16 +12,16 @@ import json
 from datetime import date
 from uuid import uuid4
 
-from ledger.domain.adjudicate import adjudicate, build_prompt
-from ledger.domain.conflicts import (
+from domain.adjudicate import adjudicate, build_prompt
+from domain.conflicts import (
     detect,
     find_arithmetic_mismatches,
     find_same_predicate_different_value,
     find_temporal_precedence_violations,
 )
-from ledger.domain.reconcile import FactView
-from ledger.graph import route_after_detection
-from ledger.providers.fake import FakeProvider
+from domain.reconcile import FactView
+from providers.fake import FakeProvider
+from services.graph import route_after_detection
 
 
 def _fact(

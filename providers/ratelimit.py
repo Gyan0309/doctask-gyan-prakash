@@ -22,7 +22,7 @@ import logging
 import threading
 import time
 
-from ledger.logging_config import get_logger, log
+from utils.logging_config import get_logger, log
 
 logger = get_logger(__name__)
 

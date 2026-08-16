@@ -12,11 +12,11 @@ import uuid
 import pytest
 from sqlalchemy.engine import Engine
 
-from ledger import service
-from ledger.db import session_scope
-from ledger.domain.verify import verify_run
-from ledger.graph import route_after_verify
-from ledger.models import Chunk, Claim, ClaimCitation, Fact, SectionVersion
+import services.service as service
+from database.db import session_scope
+from domain.verify import verify_run
+from models import Chunk, Claim, ClaimCitation, Fact, SectionVersion
+from services.graph import route_after_verify
 
 pytestmark = pytest.mark.integration
 
@@ -222,7 +222,7 @@ class TestAFailedVerificationBlocksTheRun:
 
     @pytest.fixture
     def failing_verification(self, monkeypatch):
-        from ledger.domain.verify import VerificationFailure, VerificationReport
+        from domain.verify import VerificationFailure, VerificationReport
 
         def _always_fails(session, run_id):
             report = VerificationReport(checked=3, citations_checked=5)
@@ -236,7 +236,7 @@ class TestAFailedVerificationBlocksTheRun:
             )
             return report
 
-        monkeypatch.setattr("ledger.graph.verify_run", _always_fails)
+        monkeypatch.setattr("services.graph.verify_run", _always_fails)
 
     def test_the_run_reports_blocked_never_completed(
         self, corpus_dir, failing_verification
@@ -270,7 +270,7 @@ class TestAFailedVerificationBlocksTheRun:
     ) -> None:
         """A blocked run commits nothing, so a later run must rebuild rather than
         carry forward from an unverified predecessor."""
-        from ledger.domain.verify import VerificationFailure, VerificationReport
+        from domain.verify import VerificationFailure, VerificationReport
 
         corpus = _unique("blocked")
         path = str(corpus_dir / "msa.md")
@@ -287,7 +287,7 @@ class TestAFailedVerificationBlocksTheRun:
             )
             return report
 
-        monkeypatch.setattr("ledger.graph.verify_run", _always_fails)
+        monkeypatch.setattr("services.graph.verify_run", _always_fails)
         service.start_run(corpus_name=corpus, document_paths=[path])
 
         monkeypatch.undo()
@@ -305,7 +305,7 @@ class TestFormattingDoesNotBreakVerification:
         """The register stores "$195 per hour" where the chunk says "$195.00". Failing
         on that would make the check fire constantly and get switched off, which is
         worse than not having it."""
-        from ledger.domain.verify import _value_present
+        from domain.verify import _value_present
 
         assert _value_present("$195", "The rate is $195.00 per hour.")
         assert _value_present("$195 per hour", "rate: $195.00/hr")
@@ -314,7 +314,7 @@ class TestFormattingDoesNotBreakVerification:
 
     def test_a_genuinely_different_value_is_still_caught(self) -> None:
         """Tolerance must not become blindness."""
-        from ledger.domain.verify import _value_present
+        from domain.verify import _value_present
 
         assert not _value_present("$195", "The rate is $240 per hour.")
         assert not _value_present("State of Delaware", "governed by the laws of Texas")
