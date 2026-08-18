@@ -60,7 +60,10 @@ services:
       - path: .env
         required: false
     ports:
-      - "8000:8000"
+      # Overridable for the same reason the database port is: a reviewer with anything
+      # else already serving on 8000 cannot start this at all, and 8000 is a far more
+      # commonly occupied port than 5432. Override with API_HOST_PORT.
+      - "${API_HOST_PORT:-8000}:8000"
     volumes:
       - ./inbox:/data/inbox
     healthcheck:

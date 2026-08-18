@@ -41,6 +41,21 @@ cp corpus/seed/* inbox/ && curl -X POST localhost:8000/watch/poll
 Or drag them onto the page, which does the same thing. Either way the run parks at the
 human gate with its findings.
 
+**What you will actually see without an API key, because the difference matters.** The
+default provider is a deterministic offline stub, not a model. It keeps every stage
+runnable with no credentials, but it does not read: it assigns values positionally, so
+you get facts like `auto_renew_months = '$5,000,000'` and
+`sla_credit_percent = 'Cobalt Freight Systems Inc'`. The register then correctly refuses
+to normalize them, `detect_conflicts` finds nothing to compare, `adjudicate` records
+itself as skipped, and the gate shows **four `low` findings that all say "could not be
+normalized"**.
+
+That is the system being honest rather than the system working — **the overcharge and
+the two liability breaches are not found on this path.** To see those, set a Gemini key
+below. To judge the detection logic without a key, read the test suite instead: the
+comparators are deterministic and 435 tests exercise them directly, no credentials and
+no recorded fixtures.
+
 To use real models instead of the deterministic offline provider:
 
 ```bash
@@ -56,14 +71,29 @@ liar: Docker still reports the container healthy while your connections quietly 
 the *other* Postgres and fail authentication against credentials that are correct.
 Override with `DB_HOST_PORT` if 55432 is also taken.
 
+The API is on **8000**, overridable with `API_HOST_PORT`. That override was missing
+until a cold-start test found it: the paragraph above reasons carefully about reviewers
+already using 5432, then hardcoded the one port more likely to be taken than 5432 is.
+Same rule, not applied to its peer — which is the third time this repo has shipped that
+exact shape of bug, and the first time it was in the infrastructure rather than the
+domain code.
+
 ---
 
 ## Tests
 
 ```bash
-pytest                      # 414 tests
-pytest -m "not integration" # 332 of them need no database either
+python -m venv .venv && source .venv/Scripts/activate  # .venv/bin/activate on macOS/Linux
+pip install -r requirements-dev.txt
+
+pytest                      # 435 tests, ~21s
+pytest -m "not integration" # 350 of them need no database either
 ```
+
+The install line is not decoration. Without it `pytest` fails collection on all 14 test
+modules with `ModuleNotFoundError`, and it fails that way on a **fresh clone** — which
+is the first thing a reviewer does. CI installed dependencies before running the suite,
+so CI stayed green the whole time this line was missing from the README.
 
 **Every test runs with no API key, no network, and no recorded fixtures.** CI holds no
 credentials at all — verify it rather than believe it:

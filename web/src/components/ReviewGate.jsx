@@ -24,11 +24,21 @@ export default function ReviewGate({ runId, run, onDecided, onShowEvidence }) {
   const awaiting = Boolean(run?.awaiting_review);
 
   useEffect(() => {
-    // Default every finding to approved, which is the common case, while leaving each
-    // one individually changeable. Starting blank would make a reviewer click twice
-    // for every item they already agree with, and a queue that is tedious is a queue
-    // that gets rubber-stamped.
-    setVerdicts(Object.fromEntries(findings.map((f) => [String(f.index), "approved"])));
+    // Deliberately NOT defaulted to approved.
+    //
+    // This used to pre-select Approve on every finding, on the argument that a blank
+    // queue is tedious and tedium gets rubber-stamped. That argument is real, but it
+    // was answered in the wrong place: it made *inaction* mean approval on the one
+    // gate that actually commits. A reviewer who submits without reading approved
+    // everything, including a $2.5M liability breach, and the UI recorded them as
+    // having decided it.
+    //
+    // The tedium is instead answered by "Approve all" — one click, same outcome, but
+    // now a deliberate act with a name rather than a default nobody chose. This is
+    // the same rule ClassifyGate already applies to its own options, and the reason
+    // it gives there ("pre-selecting turns the question into a confirmation") applies
+    // with more force here, not less.
+    setVerdicts({});
     setError(null);
   }, [runId, findings.length, awaiting]);
 
@@ -106,8 +116,12 @@ export default function ReviewGate({ runId, run, onDecided, onShowEvidence }) {
   const setAll = (verdict) =>
     setVerdicts(Object.fromEntries(findings.map((f) => [String(f.index), verdict])));
 
+  // Counted from the verdicts actually recorded. The old form was
+  // `rejected = findings.length - approved`, which silently reported every
+  // undecided finding as rejected the moment approval stopped being the default.
   const approved = Object.values(verdicts).filter((v) => v === "approved").length;
-  const rejected = findings.length - approved;
+  const rejected = Object.values(verdicts).filter((v) => v === "rejected").length;
+  const undecided = findings.length - approved - rejected;
 
   // Severity order, not the order the pipeline happened to emit them in. A reviewer
   // working top to bottom should meet the $1.2M liability breach before a missing
@@ -192,13 +206,26 @@ export default function ReviewGate({ runId, run, onDecided, onShowEvidence }) {
       })}
 
       <div className="gatefoot">
-        <button className="primary" onClick={submit} disabled={submitting}>
+        {/* Held closed until every finding has a verdict. Submitting a partial review
+            would commit the undecided ones under whatever the server treats as
+            missing, and "I never looked at it" must not resolve to a verdict. */}
+        <button
+          className="primary"
+          onClick={submit}
+          disabled={submitting || undecided > 0}
+        >
           {submitting
             ? "Submitting…"
             : `Submit ${findings.length} decision${findings.length === 1 ? "" : "s"}`}
         </button>
         <span className="tally-text">
           {approved} approved, {rejected} rejected
+          {undecided > 0 && (
+            <>
+              {" · "}
+              <strong>{undecided} still to decide</strong>
+            </>
+          )}
         </span>
       </div>
     </section>
