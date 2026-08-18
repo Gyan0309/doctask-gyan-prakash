@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from uuid import UUID
 
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from models import Claim, ClaimCitation, SectionDependency, SectionVersion
@@ -241,9 +242,27 @@ def apply_plan(
         session.query(SectionDependency).filter(
             SectionDependency.section_key == section.section_key
         ).delete(synchronize_session=False)
-        for fact_id in section.fact_ids:
-            session.add(
-                SectionDependency(section_key=section.section_key, fact_id=fact_id)
+
+        # ON CONFLICT DO NOTHING, because delete-then-insert is a check-then-insert
+        # race and this table is the third place in this project to lose it. Two runs
+        # composing the same section both delete (neither sees the other's uncommitted
+        # rows), then both insert the same (section_key, fact_id) — and the second one
+        # dies on the primary key once the first commits. Under twenty concurrent runs
+        # that killed eight of them.
+        #
+        # Safe to swallow because the row *is* its primary key: this table has no
+        # payload columns, so an existing (section_key, fact_id) already says exactly
+        # what the insert was going to say. Nothing is lost by not writing it twice.
+        if section.fact_ids:
+            session.execute(
+                pg_insert(SectionDependency)
+                .values(
+                    [
+                        {"section_key": section.section_key, "fact_id": fact_id}
+                        for fact_id in section.fact_ids
+                    ]
+                )
+                .on_conflict_do_nothing(index_elements=["section_key", "fact_id"])
             )
 
     for key in plan.carry_forward:
