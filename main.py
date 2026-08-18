@@ -12,6 +12,7 @@ routes appear here only once the stages behind them exist.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -122,11 +123,19 @@ async def announce_startup() -> None:
         corpus_name=settings.watch_corpus_name,
         interval_seconds=settings.watch_interval_seconds,
         start_run=service.start_run,
+        known=service.known_document_hashes,
     )
 
+    # Primed unconditionally, not only when the timer is enabled.
+    #
+    # Priming used to happen inside `start()`, which only runs with `watch_enabled=true`
+    # — off by default. So on the shipped configuration `/watch/poll` came up with empty
+    # state after every restart and reported the entire inbox as newly added, starting a
+    # run for it. Cheap (facts are reused, no model calls) and false, which is the worse
+    # half.
+    _watcher.prime()
+
     if settings.watch_enabled:
-        # `start()` primes first, so a restart does not re-process the whole directory
-        # as though it had just arrived.
         _watcher.start()
 
 
@@ -215,13 +224,64 @@ async def upload_documents(files: list[UploadFile] = _UPLOADED_FILES) -> dict[st
 
     log(logger, logging.INFO, "documents uploaded", files=", ".join(saved))
 
-    result = _watcher.poll()
+    # Return as soon as the run has an id, not when the run finishes.
+    #
+    # Holding the request open for the whole run was honest but unusable: a cold corpus
+    # is a minute of a dropzone saying "Running…", and the browser cannot show the
+    # stages it is waiting on because it is blocked on the same request. The run id is
+    # available the moment the row is inserted, and the page already polls a running
+    # run — so handing back the id turns a blocking wait into a live one.
+    started: dict[str, str] = {}
+    has_id = threading.Event()
+
+    def _announce(run_id: str) -> None:
+        started["run_id"] = run_id
+        has_id.set()
+
+    outcome: dict[str, Any] = {}
+
+    def _drive() -> None:
+        try:
+            outcome["result"] = _watcher.poll(on_started=_announce)
+        except Exception as exc:
+            log(
+                logger,
+                logging.ERROR,
+                "upload-triggered run failed",
+                error=type(exc).__name__,
+                detail=str(exc)[:300],
+            )
+        finally:
+            # Unblocks the request even when the poll found nothing to do or died
+            # before a run existed; otherwise the caller waits out the timeout for an
+            # id that is never coming.
+            has_id.set()
+
+    threading.Thread(target=_drive, daemon=True, name="ledger-upload").start()
+
+    # Bounded: ingestion is filesystem work and reaches the insert quickly. If it has
+    # not by now, answer anyway rather than reintroducing the blocking wait.
+    has_id.wait(timeout=15)
+
+    # How many documents the run actually covers, which is not how many were just
+    # uploaded.
+    #
+    # A drop of three files starts a run over the whole watched folder — correct, because
+    # the register is over a corpus rather than over an upload, and cheap, because the
+    # documents already ingested are reused without a model call. But "3 added — run
+    # started" reads as though three documents are being processed, and a reviewer who
+    # then watches fourteen classifications go by has been misled by the interface rather
+    # than by the system.
+    in_corpus = len(
+        [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES]
+    )
+
     return {
         "saved": saved,
-        "added": result.added,
-        "modified": result.modified,
-        "triggered": result.triggered,
-        "run_id": result.run_id,
+        "corpus_documents": in_corpus,
+        "run_id": started.get("run_id"),
+        "status": "running" if started.get("run_id") else "no_run_started",
+        "poll": f"/runs/{started['run_id']}" if started.get("run_id") else None,
     }
 
 

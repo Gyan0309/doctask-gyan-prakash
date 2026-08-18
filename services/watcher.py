@@ -97,6 +97,7 @@ def poll_once(
     *,
     corpus_name: str,
     start_run=None,
+    on_started=None,
 ) -> PollResult:
     """Look once, and start a run if anything arrived or changed.
 
@@ -137,9 +138,11 @@ def poll_once(
     if start_run is None:
         return PollResult(added=added, modified=modified, removed=removed)
 
+    kwargs = {"on_started": on_started} if on_started is not None else {}
     result = start_run(
         corpus_name=corpus_name,
         document_paths=[str(directory / name) for name in sorted(current)],
+        **kwargs,
     )
     return PollResult(
         added=added, modified=modified, removed=removed, run_id=result.get("run_id")
@@ -156,37 +159,51 @@ class Watcher:
         corpus_name: str,
         interval_seconds: float = 5.0,
         start_run=None,
+        known=None,
     ) -> None:
         self.directory = directory
         self.corpus_name = corpus_name
         self.interval = interval_seconds
         self._start_run = start_run
+        # How to find out what has already been ingested. Injected rather than imported,
+        # so the watcher stays testable without a database.
+        self._known = known
         self._state = WatchState()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def prime(self) -> None:
-        """Record what is already there without triggering a run.
+        """Record what has already been *ingested*, without triggering a run.
 
-        Called at startup so restarting the service does not re-process the entire
+        Called at startup so restarting the service does not re-process the whole
         directory as though it had just arrived — which, on a free tier measured in
-        requests per day, would exhaust the budget on work already done.
+        requests per day, would exhaust the budget on work already done, and would report
+        thirty-six documents as new when none were.
+
+        Primed from the corpus, not from the directory listing. Reading the filesystem
+        gets the restart case right and the fresh-deployment case wrong: it would mark an
+        inbox full of never-ingested documents as already seen, and nothing would ever
+        process them. What has been ingested is a question only the database can answer.
+
+        With no source of truth available it primes empty, which fails towards doing the
+        work rather than towards skipping it.
         """
-        self._state.seen = list_documents(self.directory)
+        self._state.seen = self._known(self.corpus_name) if self._known else {}
         log(
             logger,
             logging.INFO,
-            "watcher primed with existing documents",
+            "watcher primed from the corpus",
             directory=str(self.directory),
             documents=len(self._state.seen),
         )
 
-    def poll(self) -> PollResult:
+    def poll(self, *, on_started=None) -> PollResult:
         return poll_once(
             self.directory,
             self._state,
             corpus_name=self.corpus_name,
             start_run=self._start_run,
+            on_started=on_started,
         )
 
     def _loop(self) -> None:

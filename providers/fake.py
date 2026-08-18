@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -64,6 +65,76 @@ class FakeProvider(ModelProvider):
     @staticmethod
     def _seed(prompt: str) -> int:
         return int(hashlib.sha256(prompt.encode()).hexdigest()[:8], 16)
+
+    # What a stub should call a document, keyed off its filename. First match wins, so
+    # the more specific patterns come first.
+    _KIND_HINTS = (
+        ("credit-note", "invoice"),
+        ("credit_note", "invoice"),
+        ("invoice", "invoice"),
+        ("application", "invoice"),
+        ("amendment", "amendment"),
+        ("change-order", "amendment"),
+        ("rate-adjustment", "amendment"),
+        ("rate-revision", "amendment"),
+        ("side-letter", "amendment"),
+        ("addendum", "amendment"),
+        ("dpa", "amendment"),
+        ("renewal", "renewal_notice"),
+        ("sow", "sow"),
+        ("statement-of-work", "sow"),
+        ("order-form", "sow"),
+    )
+
+    @classmethod
+    def _kind_for(cls, prompt: str) -> str:
+        """The document kind a stub should return, derived from the filename.
+
+        Previously this came out of `enum[seed % len(enum)]`, and the seed is a hash of
+        the prompt — so **editing the classification prompt silently reshuffled every
+        synthetic document's kind**. That is not a hypothetical: adding one field to the
+        classify schema turned an MSA fixture into an invoice, and a verification test
+        failed on a precondition about supported claims, thirty lines away from anything
+        to do with classification. A stub whose answers move when unrelated text moves
+        makes every downstream precondition a coin flip.
+
+        Deriving it from the filename is stable under prompt edits, and it makes
+        multi-document fixtures behave sensibly: an `msa.md` plus an `invoice.md`
+        actually produce a governing value and an observation that can contradict it.
+
+        `msa` is the default because the clean path is what a stub should produce
+        unprompted. A test that wants another kind names its file accordingly, which
+        also puts the intent in the fixture rather than in a hash.
+        """
+        match = re.search(r'<untrusted_document name="([^"]*)"', prompt)
+        name = (match.group(1) if match else prompt).lower()
+        for hint, kind in cls._KIND_HINTS:
+            if hint in name:
+                return kind
+        return "msa"
+
+    @classmethod
+    def _predicates_for(cls, prompt: str, enum: list[str]) -> list[str]:
+        """The predicates a stub may emit for the document it is pretending to read.
+
+        The stub has to be internally consistent, or it manufactures facts the real
+        system is right to refuse. Billing predicates are only legitimate on a document
+        that bills, so a stub calling a file `msa.md` and then emitting `invoice_hours`
+        for it produced facts that were correctly dropped downstream — leaving a run with
+        no facts, no register and no sections, and half a dozen tests failing on
+        preconditions about claims.
+
+        Filtered rather than remapped: the choice within the allowed set stays
+        seed-driven, so a test asserting on an exact predicate still gets a stable
+        answer.
+        """
+        # Imported here rather than at module scope: the rule belongs to the domain, and
+        # a stub is not the place to keep a second copy of it that can drift.
+        from domain.extract import predicate_allowed
+
+        kind = cls._kind_for(prompt)
+        allowed = [p for p in enum if predicate_allowed(p, kind)]
+        return allowed or list(enum)
 
     @staticmethod
     def _source_lines(prompt: str) -> list[str]:
@@ -123,8 +194,19 @@ class FakeProvider(ModelProvider):
                 return round(0.90 + (seed % 10) / 100, 2)
             return seed % 1000
         if kind == "BOOLEAN":
+            # Same reasoning as `confidence` above, and the same trap: `seed % 2` would
+            # mark half of all synthetic documents as an ill-fitting kind and route them
+            # to the human gate at random, making every test downstream of
+            # classification flaky for reasons unrelated to what it tests. A test that
+            # wants the escalation branch scripts the poor fit explicitly.
+            if field_name == "fits_kind":
+                return True
             return seed % 2 == 0
         if enum := schema.get("enum"):
+            if field_name == "kind" and "msa" in enum:
+                return self._kind_for(root_prompt)
+            if field_name == "predicate":
+                enum = self._predicates_for(root_prompt, enum)
             return enum[seed % len(enum)]
 
         # `quote` and `value_raw` must both come from the SAME line of the real source.

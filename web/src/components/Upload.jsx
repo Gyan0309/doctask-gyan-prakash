@@ -23,9 +23,17 @@ export default function Upload({ onUploaded }) {
     setMessage(null);
     try {
       const result = await api.uploadDocuments(files);
+      // Says what the run covers, not just what was dropped. A register is over a
+      // corpus, so three new files start a run across the whole folder — the other
+      // documents are reused without a model call, but a reviewer watching fourteen
+      // classifications go by after adding three files should not have to work that out.
+      const scope =
+        result.corpus_documents > result.saved.length
+          ? ` — run started over all ${result.corpus_documents} documents in the corpus`
+          : " — run started";
       setMessage(
-        result.triggered
-          ? `${result.saved.length} added — run started`
+        result.run_id
+          ? `${result.saved.length} added${scope}`
           : `${result.saved.length} uploaded; nothing changed, so no run started`,
       );
       await onUploaded(result.run_id);
@@ -55,12 +63,12 @@ export default function Upload({ onUploaded }) {
           send(e.dataTransfer.files);
         }}
       >
-        {busy ? "Running…" : "Drop a document, or click to choose"}
+        {busy ? "Uploading…" : "Drop a document, or click to choose"}
         <div className="hint">
-          {/* The upload returns only once the run reaches the gate, which is a
-              minute or so on a cold corpus. Saying so beats a spinner that looks
-              stuck. */}
-          {busy ? "extracting and checking — this can take a minute" : "PDF, Markdown or text"}
+          {/* The upload now returns as soon as the run has an id; the run itself is
+              watched by the polling in App. So this is a file-transfer wait measured
+              in moments, not the whole run. */}
+          {busy ? "handing off to the pipeline" : "PDF, Markdown or text"}
         </div>
       </div>
 

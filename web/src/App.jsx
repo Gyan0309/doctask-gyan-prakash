@@ -1,10 +1,29 @@
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./api";
+import ClassifyGate from "./components/ClassifyGate.jsx";
 import Register from "./components/Register.jsx";
 import ReviewGate from "./components/ReviewGate.jsx";
 import Provenance from "./components/Provenance.jsx";
 import RunList from "./components/RunList.jsx";
 import Upload from "./components/Upload.jsx";
+
+// Stage names in the words a reviewer would use. The graph's own node names are
+// accurate and read like internals — "detect_conflicts" is not what a person waiting on
+// a run wants to be told they are waiting for.
+const STAGE_LABELS = {
+  ingest: "reading documents",
+  classify: "identifying documents",
+  escalate: "waiting on a classification",
+  extract: "extracting terms",
+  detect_conflicts: "comparing documents",
+  adjudicate: "judging conflicts",
+  compose: "building the register",
+  examine: "applying the playbook",
+  verify: "verifying citations",
+  gate: "waiting for review",
+  commit: "committing",
+  blocked: "blocked",
+};
 
 export default function App() {
   const [runs, setRuns] = useState([]);
@@ -87,14 +106,21 @@ export default function App() {
     [refreshRuns],
   );
 
-  const pendingCount = run?.pending_findings?.length ?? 0;
+  const pendingCount =
+    (run?.pending_findings?.length ?? 0) + (run?.escalations?.length ?? 0);
   const rowCount = deliverable?.sections?.length ?? 0;
 
   // Land on whichever pane has something to do. A completed run opening on an empty
   // review pane hides the deliverable behind a click for no reason.
   useEffect(() => {
-    setTab(run?.awaiting_review || run?.status === "interrupted" ? "review" : "register");
-  }, [runId, run?.awaiting_review, run?.status]);
+    setTab(
+      run?.awaiting_review ||
+        run?.awaiting_classification ||
+        run?.status === "interrupted"
+        ? "review"
+        : "register",
+    );
+  }, [runId, run?.awaiting_review, run?.awaiting_classification, run?.status]);
 
   // Evidence lives in the right-hand panel, which is visible from either pane, so
   // showing it must not silently leave the reviewer on a different tab.
@@ -109,6 +135,19 @@ export default function App() {
         {run && (
           <span className="status">
             {run.status.replace(/_/g, " ")}
+            {/* What it is doing, not just that it is doing something. Stage metrics
+                only land when a stage finishes, so a two-minute run used to show
+                "running · 0 rows" for ninety seconds with no way to tell progress
+                from a hang. */}
+            {run.current_stage && (
+              <>
+                {" · "}
+                <span className="stage">
+                  {STAGE_LABELS[run.current_stage] ?? run.current_stage}
+                </span>
+                {run.stage_detail ? ` — ${run.stage_detail}` : ""}
+              </>
+            )}
             {deliverable ? ` · ${deliverable.sections.length} rows` : ""}
           </span>
         )}
@@ -148,12 +187,20 @@ export default function App() {
           </nav>
 
           {tab === "review" ? (
-            <ReviewGate
-              runId={runId}
-              run={run}
-              onDecided={afterDecisions}
-              onShowEvidence={showEvidence}
-            />
+            /* The classification gate takes the pane when it is open. It arrives before
+               extraction, so there is nothing else to review yet — showing an empty
+               review queue beside an unanswered question would hide the only thing the
+               run is actually waiting on. */
+            run?.awaiting_classification ? (
+              <ClassifyGate runId={runId} run={run} onDecided={afterDecisions} />
+            ) : (
+              <ReviewGate
+                runId={runId}
+                run={run}
+                onDecided={afterDecisions}
+                onShowEvidence={showEvidence}
+              />
+            )
           ) : (
             <Register
               runId={runId}

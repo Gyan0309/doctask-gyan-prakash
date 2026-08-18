@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import pytest
 
+from domain.normalize import is_formula, normalize
 from domain.reconcile import FactView, reconcile
 from domain.rules import (
     RuleError,
@@ -199,3 +200,111 @@ class TestRuleEvaluation:
             _fact("liability_cap", "$1,000,000"),
         ]
         assert self._violations(facts) == []
+
+
+class TestACapWrittenAsAFormula:
+    """The latent false pass.
+
+    Brightmoor's cap reads "the lesser of (i) three (3) times the fees charged on that
+    matter and (ii) five million dollars ($5,000,000)". The money parser took the first
+    digit run — the `(3)` in "three (3) times" — so the comparable magnitude behind that
+    clause was 3. It stayed invisible only because `annual_fees` was missing and the rule
+    returned "not checked". With that fact present, LIAB-01 would have compared 3 against
+    twice the annual fees and reported a **pass**.
+    """
+
+    BRIGHTMOOR = (
+        "the lesser of (i) three (3) times the fees charged on that matter and "
+        "(ii) five million dollars ($5,000,000)"
+    )
+    TALUS = (
+        "the greater of (a) two million dollars ($2,000,000) and (b) the fees paid in "
+        "the twelve months preceding the claim"
+    )
+
+    def setup_method(self) -> None:
+        _, self.rules = load_rules(PLAYBOOK)
+
+    def _violations(self, facts):
+        return evaluate(self.rules, reconcile(facts))
+
+    def test_the_formula_has_no_magnitude(self) -> None:
+        assert normalize("liability_cap", self.BRIGHTMOOR) is None
+        assert is_formula(self.BRIGHTMOOR)
+
+    def test_it_no_longer_normalizes_to_three(self) -> None:
+        result = normalize("liability_cap", self.BRIGHTMOOR)
+        assert result is None or result.number != Decimal(3)
+
+    def test_the_rule_does_not_certify_it_as_compliant(self) -> None:
+        """The failure this prevents: a cap passing a bound on a number that means
+        nothing. With annual fees present, the old parser compared 3 against 1,200,000
+        and called it a pass."""
+        found = self._violations(
+            [_fact("annual_fees", "$600,000"), _fact("liability_cap", self.BRIGHTMOOR)]
+        )
+
+        liab = [v for v in found if v.rule.code == "LIAB-01"]
+        assert liab, "a cap it cannot compare must be reported, never silently passed"
+        assert liab[0].checked is False
+        assert "formula rather than an amount" in liab[0].explanation
+
+    def test_a_cap_that_only_looked_right_is_also_refused(self) -> None:
+        """Talus's cap happened to parse as $2,000,000, which was luck rather than
+        correctness: "the greater of $2,000,000 and twelve months of fees" is not
+        $2,000,000, it is at least that."""
+        assert normalize("liability_cap", self.TALUS) is None
+
+    def test_an_ordinary_amount_still_normalizes(self) -> None:
+        """The refusal must be narrow. "in aggregate" is not a formula marker, because
+        "$2,500,000 in aggregate" is an amount."""
+        for raw, expected in (
+            ("$2,500,000", 2500000),
+            ("$2,500,000 in aggregate", 2500000),
+            ("$1,200,000 per occurrence", 1200000),
+        ):
+            result = normalize("liability_cap", raw)
+            assert result is not None, f"{raw!r} must still be comparable"
+            assert result.number == Decimal(expected)
+
+
+class TestNotCheckedIsNotTheSameAsBreached:
+    """Three of seven `high` findings in a live run were "could not be evaluated".
+
+    The honesty was right; the placement was wrong. Non-findings at the top of the queue
+    teach a reviewer to skim the high band, which costs more than the rule buys.
+    """
+
+    def setup_method(self) -> None:
+        _, self.rules = load_rules(PLAYBOOK)
+
+    def _violations(self, facts):
+        return evaluate(self.rules, reconcile(facts))
+
+    def test_a_rule_that_could_not_run_is_reported_at_low(self) -> None:
+        found = self._violations([_fact("liability_cap", "$5,000,000")])
+
+        liab = [v for v in found if v.rule.code == "LIAB-01"]
+        assert liab, "an unevaluated rule must still be reported"
+        assert liab[0].rule.severity == "high", "the rule itself is a high-severity rule"
+        assert liab[0].severity == "low", "but not being able to check it is not"
+        assert liab[0].checked is False
+
+    def test_a_real_breach_keeps_the_rules_severity(self) -> None:
+        found = self._violations(
+            [_fact("annual_fees", "$600,000"), _fact("liability_cap", "$2,500,000")]
+        )
+
+        liab = [v for v in found if v.rule.code == "LIAB-01"]
+        assert liab and liab[0].checked is True
+        assert liab[0].severity == "high"
+
+    def test_an_unreadable_value_says_so_rather_than_going_quiet(self) -> None:
+        """The silent version of this cost a vendor three playbook checks between two
+        runs, with nothing in the register to show it had happened."""
+        found = self._violations([_fact("payment_terms_days", "to be agreed")])
+
+        pay = [v for v in found if v.rule.code == "PAY-01"]
+        assert pay, "a value with no magnitude must not silently skip the rule"
+        assert pay[0].checked is False
+        assert "cannot" in pay[0].explanation or "not in a form" in pay[0].explanation

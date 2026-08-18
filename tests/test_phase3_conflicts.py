@@ -126,6 +126,76 @@ class TestTemporalPrecedence:
 
         assert find_temporal_precedence_violations([amendment, undated]) == []
 
+    def test_an_observation_is_only_compared_within_its_own_scope(self) -> None:
+        """A rate card is many roles under one predicate. An invoice billing the partner
+        rate must be judged against the *partner* governing rate, never against whichever
+        grade happens to sort last.
+
+        This comparator grouped by (subject, term) with no scope, so a managing-partner
+        observation was measured against a litigation-support governing rate — a live run
+        reported a partner rate "$720 HIGHER" than agreed, which was $905 (managing
+        partner, observed) minus $185 (litigation support, governing): two different
+        grades subtracted. `reconcile` and comparator 1 already grouped by scope; this
+        one did not, so a rate card fought itself through it even after the others were
+        taught not to.
+        """
+        partner = _fact("hourly_rate", "$840", "msa", date(2026, 1, 1), scope="partner")
+        # A different grade, later-dated, so a scope-blind governing_value_at picks *it*.
+        litigation = _fact(
+            "hourly_rate", "$185", "msa", date(2026, 2, 1), scope="litigation support"
+        )
+        # The invoice bills the agreed partner rate — nothing is wrong.
+        invoice = _fact(
+            "invoice_rate", "$840", "invoice", date(2026, 3, 1), scope="partner"
+        )
+
+        assert find_temporal_precedence_violations([partner, litigation, invoice]) == []
+
+    def test_a_wrong_rate_is_caught_against_the_matching_scope(self) -> None:
+        """The fix must not buy its quiet by going silent on real overbilling. A partner
+        invoice above the partner rate is a finding — and it must be measured against the
+        partner rate ($840), not a different grade ($185)."""
+        partner = _fact("hourly_rate", "$840", "msa", date(2026, 1, 1), scope="partner")
+        litigation = _fact(
+            "hourly_rate", "$185", "msa", date(2026, 2, 1), scope="litigation support"
+        )
+        invoice = _fact(
+            "invoice_rate", "$900", "invoice", date(2026, 3, 1), scope="partner"
+        )
+
+        found = find_temporal_precedence_violations([partner, litigation, invoice])
+
+        assert len(found) == 1
+        assert "$840" in found[0].detail, "must be judged against the partner rate"
+        assert "$185" not in found[0].detail, "never against a different grade"
+
+    def test_two_scopes_from_one_document_each_get_a_finding(self) -> None:
+        """Once scope splits the groups, the dedup marker has to split with it. The
+        marker keyed on (document, subject, term) alone, so one invoice overbilling two
+        grades would report only the first and silently swallow the second as a
+        duplicate. Scope belongs in the marker too."""
+        partner_rate = _fact(
+            "hourly_rate", "$840", "msa", date(2026, 1, 1), scope="partner"
+        )
+        associate_rate = _fact(
+            "hourly_rate", "$400", "msa", date(2026, 1, 1), scope="associate"
+        )
+        doc = uuid4()
+        partner_bill = _fact(
+            "invoice_rate", "$900", "invoice", date(2026, 3, 1),
+            scope="partner", document=doc,
+        )
+        associate_bill = _fact(
+            "invoice_rate", "$450", "invoice", date(2026, 3, 1),
+            scope="associate", document=doc,
+        )
+
+        found = find_temporal_precedence_violations(
+            [partner_rate, associate_rate, partner_bill, associate_bill]
+        )
+
+        assert len(found) == 2, "each grade overbilled is its own finding"
+
 
 class TestSamePredicateDifferentValue:
     def test_two_equally_authoritative_documents_disagreeing_is_a_conflict(self) -> None:
@@ -208,6 +278,90 @@ class TestArithmeticMismatch:
             _fact("invoice_amount", "$21,600.00", "invoice", document=doc),
             _fact("invoice_rate", "$180.00", "invoice", document=doc),
         ]  # no hours
+        assert find_arithmetic_mismatches(facts) == []
+
+
+class TestArithmeticIsPerLine:
+    """A real invoice is many lines, and the identity that holds is per line —
+    rate x hours = that line's amount — not per document.
+
+    The comparator grouped only by document and kept one fact per predicate, so it
+    subtracted a single line's product from the grand total: on the live corpus,
+    `$22,611` (thirteen lines plus a subscription overage) minus `$245 x 7.5` for one of
+    those lines, reported as a $20,773.50 discrepancy in the high band. Four such
+    findings, and the corpus's real arithmetic error was not among them.
+
+    A billed line is identified by its qualifier, which reaches the comparator as
+    `scope`; the unqualified facts are the invoice's headline totals, not a line.
+    """
+
+    def _line(self, rate, hours, amount, *, qualifier, doc):
+        day = date(2026, 1, 31)
+        return [
+            _fact("invoice_rate", rate, "invoice", day, scope=qualifier, document=doc),
+            _fact("invoice_hours", hours, "invoice", day, scope=qualifier, document=doc),
+            _fact("invoice_amount", amount, "invoice", day, scope=qualifier, document=doc),
+        ]
+
+    def test_a_correct_multi_line_invoice_is_silent(self) -> None:
+        """Every line multiplies out; the whole invoice is silence — including the
+        unqualified totals, which must not be multiplied against each other."""
+        doc = uuid4()
+        facts = [
+            *self._line("$245.00", "8.0", "$1,960.00", qualifier="k osei 2026-01-05", doc=doc),
+            *self._line("$190.00", "8.0", "$1,520.00", qualifier="r delacroix 2026-01-12", doc=doc),
+            *self._line("$335.00", "6.0", "$2,010.00", qualifier="t whitfield 2026-01-19", doc=doc),
+            # Headline totals, unqualified: a standard rate, total hours, and a grand
+            # total folding in a non-time charge. $245 x 89.0 = $21,805, not $22,611 —
+            # exactly the subtraction the old comparator fabricated a finding from.
+            _fact("invoice_rate", "$245.00", "invoice", date(2026, 1, 31), document=doc),
+            _fact("invoice_hours", "89.0", "invoice", date(2026, 1, 31), document=doc),
+            _fact("invoice_amount", "$22,611.00", "invoice", date(2026, 1, 31), document=doc),
+        ]
+
+        assert find_arithmetic_mismatches(facts) == []
+
+    def test_a_single_wrong_line_is_caught_on_that_line(self) -> None:
+        """Real per-line errors survive the fix. The wrong line is not the last one
+        extracted, so the old keep-the-last behaviour would have checked the correct
+        line and stayed silent."""
+        doc = uuid4()
+        facts = [
+            # 8.0 x $190 = $1,520, but the line states $1,600 — a genuine error.
+            *self._line("$190.00", "8.0", "$1,600.00", qualifier="r delacroix 2026-01-12", doc=doc),
+            *self._line("$245.00", "8.0", "$1,960.00", qualifier="k osei 2026-01-26", doc=doc),
+        ]
+
+        found = find_arithmetic_mismatches(facts)
+
+        assert len(found) == 1
+        detail = found[0].detail.replace(",", "")
+        assert "1520" in detail and "1600" in detail
+
+    def test_duplicated_line_facts_do_not_multiply_the_findings(self) -> None:
+        """Facts are re-extracted across runs, so a line arrives several times over. The
+        live DB holds each line three times. Identical copies are one line, one check —
+        not one finding per copy."""
+        doc = uuid4()
+        line = self._line(
+            "$190.00", "8.0", "$1,600.00", qualifier="r delacroix 2026-01-12", doc=doc
+        )
+
+        assert len(find_arithmetic_mismatches(line * 3)) == 1
+
+    def test_a_line_with_conflicting_copies_is_not_guessed(self) -> None:
+        """When two extractions disagree on a line's rate, which one to multiply is a
+        guess — and a guessed mismatch is the fabrication this comparator exists to
+        avoid. $190 x 8 = $1,520 matches the stated amount; $200 x 8 does not."""
+        doc = uuid4()
+        day = date(2026, 1, 31)
+        facts = [
+            _fact("invoice_rate", "$190.00", "invoice", day, scope="line", document=doc),
+            _fact("invoice_rate", "$200.00", "invoice", day, scope="line", document=doc),
+            _fact("invoice_hours", "8.0", "invoice", day, scope="line", document=doc),
+            _fact("invoice_amount", "$1,520.00", "invoice", day, scope="line", document=doc),
+        ]
+
         assert find_arithmetic_mismatches(facts) == []
 
 

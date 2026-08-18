@@ -25,8 +25,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
+from domain.direction import Comparison, compare
 from domain.normalize import normalize
-from domain.reconcile import FactView, governing_value_at
+from domain.reconcile import (
+    FactView,
+    canonical_scope,
+    canonical_subject,
+    governing_value_at,
+)
 
 # What each comparator is for, in one line, because these strings surface in the UI.
 # Which governing term an observational predicate is evidence *about*.
@@ -78,6 +84,11 @@ class ConflictCandidate:
     a: FactView
     b: FactView
     detail: str
+    # Which way the difference runs, stated by the comparator that measured it. The
+    # adjudicator is shown this rather than left to infer it from the values, and its
+    # explanation is checked against it — a live run produced a finding that reversed
+    # the sign of a $60 under-billing and recommended requesting a refund.
+    comparison: Comparison | None = None
 
     def pair_key(self) -> tuple:
         """Stable identity for deduplication, order-independent."""
@@ -87,6 +98,11 @@ class ConflictCandidate:
 def _magnitude(fact: FactView) -> Decimal | None:
     normalized = normalize(fact.predicate, fact.value_raw)
     return normalized.number if normalized else None
+
+
+def _unit(fact: FactView) -> str | None:
+    normalized = normalize(fact.predicate, fact.value_raw)
+    return normalized.unit if normalized else None
 
 
 def _comparable(a: FactView, b: FactView) -> bool:
@@ -121,9 +137,25 @@ def find_same_predicate_different_value(facts: list[FactView]) -> list[ConflictC
 
     for fact in facts:
         if fact.governs:
-            grouped.setdefault((fact.subject, fact.predicate, fact.scope), []).append(fact)
+            # Folded, exactly as reconcile folds them. Grouping here on the raw
+            # strings meant `ARDENT FACILITIES MANAGEMENT LLC` and `Ardent Facilities
+            # Management LLC` were two vendors to the comparators, and `out-of-hours`
+            # and `Out of Hours` two scopes — so a rate card still fought itself across
+            # documents even after reconciliation had been taught not to.
+            grouped.setdefault(
+                (
+                    canonical_subject(fact.subject),
+                    fact.predicate,
+                    canonical_scope(fact.scope),
+                ),
+                [],
+            ).append(fact)
 
-    for (subject, predicate, _scope), group in grouped.items():
+    for (_folded, predicate, _scope), group in grouped.items():
+        # Group on the folded name, report the written one — otherwise a finding reads
+        # "ardent facilities management llc", which is a folding key leaking into text
+        # a human is meant to act on.
+        subject = group[0].subject
         for i, a in enumerate(group):
             for b in group[i + 1 :]:
                 if a.effective_date != b.effective_date or a.precedence != b.precedence:
@@ -148,6 +180,7 @@ def find_same_predicate_different_value(facts: list[FactView]) -> list[ConflictC
                             f"Both carry the same effective date and precedence, so "
                             f"neither supersedes the other."
                         ),
+                        comparison=compare(ma, mb, _unit(a)),
                     )
                 )
 
@@ -168,28 +201,47 @@ def find_temporal_precedence_violations(facts: list[FactView]) -> list[ConflictC
     lands — a false-positive machine that trains people to ignore the output.
     """
     candidates: list[ConflictCandidate] = []
-    by_term: dict[tuple[str, str], list[FactView]] = {}
+    by_term: dict[tuple[str, str, str | None], list[FactView]] = {}
 
-    # Grouped by the term a fact speaks *about*, not by its own predicate name, so an
-    # invoice's `invoice_rate` lands alongside the agreement's `hourly_rate`.
+    # Grouped by the term a fact speaks *about* (so an invoice's `invoice_rate` lands
+    # alongside the agreement's `hourly_rate`) **and by scope** (so a partner-grade
+    # observation is never measured against a litigation-support governing rate).
+    #
+    # Scope was honoured by `reconcile` and by comparator 1, but not here — the same
+    # "folds in one place, not its peer" fault the vendor fix had. A live run reported a
+    # managing-partner rate "$720 HIGHER" than agreed; that was $905 (managing partner,
+    # observed) minus $185 (litigation support, governing) — two different grades
+    # subtracted — and the direction fix printed the fabricated difference as fact. A
+    # rate card fought itself through this comparator even after the others learned not
+    # to. Facts sharing a governed term but not a scope are different rows, and a scope
+    # that does not match on both sides means the two simply cannot be compared.
     for fact in facts:
-        by_term.setdefault((fact.subject, governed_predicate(fact.predicate)), []).append(
-            fact
-        )
+        by_term.setdefault(
+            (
+                canonical_subject(fact.subject),
+                governed_predicate(fact.predicate),
+                canonical_scope(fact.scope),
+            ),
+            [],
+        ).append(fact)
 
-    # One finding per (document, term). A document routinely states the same value
-    # twice — an invoice gives its rate in the line-item table and again in prose, so
-    # it is extracted as both `invoice_rate` and `hourly_rate` — and reporting both
+    # One finding per (document, term, scope). A document routinely states the same
+    # value twice — an invoice gives its rate in the line-item table and again in prose,
+    # so it is extracted as both `invoice_rate` and `hourly_rate` — and reporting both
     # produces two identical findings for one problem. Duplicate findings are not a
     # cosmetic issue: a reviewer working a queue has to read and dismiss each one, and
-    # learns that the queue wastes their time.
+    # learns that the queue wastes their time. Scope is part of the marker because it is
+    # part of the group: one invoice overbilling both the partner and associate lines is
+    # two problems, and a marker without scope would swallow the second as a duplicate.
     reported: set[tuple] = set()
 
-    for (subject, predicate), group in by_term.items():
+    for (folded_subject, predicate, scope), group in by_term.items():
+        # Folded for grouping and for the dedupe marker, written for the report.
+        subject = group[0].subject
         observations = [f for f in group if not f.governs and f.effective_date]
 
         for observation in observations:
-            marker = (observation.document_id, subject, predicate)
+            marker = (observation.document_id, folded_subject, predicate, scope)
             if marker in reported:
                 continue
             governing = governing_value_at(group, observation.effective_date)
@@ -223,6 +275,7 @@ def find_temporal_precedence_violations(facts: list[FactView]) -> list[ConflictC
                         f"({governing.document_kind}) was {governing.value_raw!r}. "
                         f"Difference: {observed - expected}."
                     ),
+                    comparison=compare(observed, expected, _unit(observation)),
                 )
             )
 
@@ -240,25 +293,68 @@ ARITHMETIC_RELATIONS = [
 ]
 
 
+def _unambiguous(group: list[FactView], predicate: str) -> FactView | None:
+    """The one fact stating this predicate on this line, or None if that is not settled.
+
+    Facts accumulate: a document re-extracted across runs states each line several times
+    over — the live corpus holds every Brightmoor line three times — and the old
+    `{f.predicate: f for f in group}` silently kept whichever arrived last. That is
+    harmless while the copies agree and a guess when they do not.
+
+    So copies that agree on magnitude are one statement, and copies that disagree are no
+    statement at all. Multiplying a rate one extraction read as $190 and another as $200
+    would report a mismatch that is an artifact of the disagreement, not a fact about the
+    bill — and a fabricated finding is the failure this comparator exists to avoid.
+    """
+    matches = [f for f in group if f.predicate == predicate]
+    if not matches:
+        return None
+    magnitudes = {_magnitude(f) for f in matches}
+    if len(magnitudes) != 1 or None in magnitudes:
+        return None
+    return matches[0]
+
+
 def find_arithmetic_mismatches(facts: list[FactView]) -> list[ConflictCandidate]:
-    """Internal inconsistency: a document whose own numbers do not multiply out.
+    """Internal inconsistency: a billed line whose own numbers do not multiply out.
 
     Scoped to a single document on purpose. Comparing a total in one document against
     components in another would be comparing different engagements and generating
     nonsense.
+
+    Scoped to a single *line* for the same reason, one level down. A real invoice is
+    many lines at several rates, and `rate x hours = amount` is an identity of a line,
+    never of a document: the Talus invoice bills thirteen time-and-materials lines at
+    three rates plus a subscription overage that is not time-based at all. Grouping by
+    document alone kept one fact per predicate and subtracted a single line's product
+    from the grand total — `$22,611` minus `$245 x 7.5` — reported as a $20,773.50
+    discrepancy in the high band. Four such findings on the live corpus, every one an
+    artifact of the grouping, and they crowded out the real arithmetic error.
+
+    A line is identified by its qualifier, which reaches here as `scope`. Unqualified
+    facts are the invoice's headline figures — a standard rate, total hours, a total
+    folding in non-time charges — and those are checked only when the document states no
+    lines at all, because then the triple genuinely is the whole bill. Once lines exist,
+    the headline rate multiplied by the headline hours is not an identity anyone asserts,
+    and treating it as one is how the fabrication started.
     """
     candidates: list[ConflictCandidate] = []
-    by_document: dict[object, list[FactView]] = {}
+    by_line: dict[tuple[object, str | None], list[FactView]] = {}
 
     for fact in facts:
-        by_document.setdefault(fact.document_id, []).append(fact)
+        by_line.setdefault((fact.document_id, canonical_scope(fact.scope)), []).append(fact)
 
-    for group in by_document.values():
-        indexed = {f.predicate: f for f in group}
+    # Documents that itemise. Their unqualified figures summarise the lines rather than
+    # standing alone, so no product is claimed over them.
+    itemised = {document_id for (document_id, scope) in by_line if scope is not None}
+
+    for (document_id, scope), group in by_line.items():
+        if scope is None and document_id in itemised:
+            continue
 
         for total_predicate, component_predicates in ARITHMETIC_RELATIONS:
-            total = indexed.get(total_predicate)
-            components = [indexed.get(p) for p in component_predicates]
+            total = _unambiguous(group, total_predicate)
+            components = [_unambiguous(group, p) for p in component_predicates]
             if total is None or any(c is None for c in components):
                 continue
 
@@ -282,10 +378,14 @@ def find_arithmetic_mismatches(facts: list[FactView]) -> list[ConflictCandidate]
                     a=total,
                     b=components[0],
                     detail=(
+                        # Named, because a mismatch a reviewer cannot locate on the bill
+                        # is a mismatch they cannot act on.
+                        f"{'On line ' + repr(scope) + ', ' if scope else ''}"
                         f"{total_predicate} is stated as {total.value_raw!r}, but "
                         f"{' x '.join(f'{c.predicate}={c.value_raw!r}' for c in components)} "
                         f"gives {product}. Difference: {total_magnitude - product}."
                     ),
+                    comparison=compare(total_magnitude, product, _unit(total)),
                 )
             )
 

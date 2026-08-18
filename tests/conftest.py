@@ -23,6 +23,57 @@ DEFAULT_TEST_DB = "postgresql+psycopg://ledger:ledger@localhost:55432/ledger"
 CONNECT_ARGS = {"connect_timeout": 3}
 
 
+def _test_database_url(configured: str) -> str:
+    """The suite's own database, beside whatever the developer is using.
+
+    Tests used to run against the same database the app does, so a `pytest` run buried
+    the run list under hundreds of `floor2-…` and `changes-…` entries — and that list
+    is the first thing anyone opening the UI sees. Worse, the suite creates runs that
+    are *deliberately* broken (killed mid-flight, blocked at verification), so the
+    development database ended up full of states no real corpus would produce.
+
+    Deriving the name rather than hardcoding it keeps one knob: point DATABASE_URL at
+    any Postgres and its `_test` sibling is what the suite uses.
+    """
+    if configured.endswith("_test"):
+        return configured
+    base, _, name = configured.rpartition("/")
+    name, sep, query = name.partition("?")
+    return f"{base}/{name}_test{sep}{query}"
+
+
+def _ensure_database(url: str) -> None:
+    """Create the test database and bring it to head, if it is not there already.
+
+    `CREATE DATABASE` cannot run inside a transaction, hence the autocommit isolation
+    level, and it is issued against the `postgres` maintenance database because you
+    cannot create a database from inside itself.
+    """
+    import subprocess
+    import sys
+
+    base, _, name = url.rpartition("/")
+    name = name.partition("?")[0]
+
+    admin = create_engine(f"{base}/postgres", connect_args=CONNECT_ARGS)
+    with admin.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        exists = conn.execute(
+            text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name}
+        ).scalar()
+        if not exists:
+            conn.execute(text(f'CREATE DATABASE "{name}"'))
+    admin.dispose()
+
+    # Migrations rather than `create_all`: the suite must exercise the same schema path
+    # a deployment takes, or a broken migration passes every test and fails on deploy.
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        env={**os.environ, "DATABASE_URL": url},
+        capture_output=True,
+        check=True,
+    )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _offline_by_default() -> None:
     """Force the offline provider for the whole suite.
@@ -32,7 +83,24 @@ def _offline_by_default() -> None:
     a slower suite that quietly spends money.
     """
     os.environ["LLM_PROVIDER"] = "fake"
-    os.environ.setdefault("DATABASE_URL", DEFAULT_TEST_DB)
+
+    # Redirect the whole session onto the `_test` sibling before anything reads config,
+    # so no test can reach the development database even by importing the app directly.
+    configured = os.environ.get("DATABASE_URL", DEFAULT_TEST_DB)
+    os.environ["DATABASE_URL"] = _test_database_url(configured)
+
+    # Pinned to empty, because a developer's `.env` must not decide test outcomes.
+    #
+    # Setting ORGANISATION_NAME for a live run turned twenty-six tests red at once: the
+    # synthetic fixtures name no organisation, so every one of them escalated for not
+    # being "ours", runs stopped before composing, and half the suite failed on
+    # preconditions about sections that were never built. The failures were real — that is
+    # exactly what the check does — but they were about the developer's environment, not
+    # about the code under test. A test that changes answer when `.env` changes is not
+    # testing what it says it is.
+    #
+    # The tests that care about this check set it themselves.
+    os.environ["ORGANISATION_NAME"] = ""
 
     from database.config import get_settings
 
@@ -41,7 +109,14 @@ def _offline_by_default() -> None:
 
 @pytest.fixture(scope="session")
 def database_url() -> str:
-    return os.environ.get("DATABASE_URL", DEFAULT_TEST_DB)
+    url = _test_database_url(os.environ.get("DATABASE_URL", DEFAULT_TEST_DB))
+    try:
+        _ensure_database(url)
+    except Exception:
+        # No Postgres, or no permission to create. Integration tests skip individually
+        # with a usable message; the unit tests neither need nor care.
+        pass
+    return url
 
 
 @pytest.fixture(scope="session", autouse=True)

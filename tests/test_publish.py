@@ -13,21 +13,50 @@ real client is exercised against the live API separately; that is a spend, not a
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
 import pytest
 
-from domain.render import render_register, render_section, section_ref
+from domain.render import humanise_term, render_register, render_section, section_ref
 from integrations.superdocs import ACTIVE_STATUSES, SuperDocsError, SuperDocsUnavailable
 from services import publish
 
 
-def _section(vendor: str, term: str, value: str, *, carried: bool) -> dict:
+def _published(sections, *, stale=(), extra=()) -> str:
+    """A document as SuperDocs currently holds it.
+
+    Publishing is now a reconciliation against this, not a replay of what the run
+    re-derived — so the fixture has to model the *published* state rather than the run's
+    provenance. `stale` names section keys whose revision in the document is out of
+    date; `extra` names refs the document still carries that the register has dropped.
+    """
+    parts = []
+    for section in sections:
+        key = section["section_key"]
+        rev = "0000dead" if key in stale else str(section["content_hash"])[:8]
+        parts.append(
+            f"### {key} [ref:{section_ref(key)}]\n\n"
+            f"body\n\n*Status: agreed. · rev {rev}*\n"
+        )
+    for key in extra:
+        parts.append(
+            f"### {key} [ref:{section_ref(key)}]\n\n"
+            f"a withdrawn obligation\n\n*Status: agreed. · rev 0000beef*\n"
+        )
+    return "\n".join(parts)
+
+
+def _section(vendor: str, term: str, value: str, *, carried: bool = False) -> dict:
+    # `carried` is retained because several older tests still pass it; the publish path
+    # no longer reads it, which is the entire point of the reconciliation change.
     return {
         "section_key": f"{vendor}::{term}",
         "carried_forward": carried,
-        "content_hash": f"hash-{vendor}-{term}",
+        # Hex, because a real content hash is sha256 and the revision marker is parsed
+        # as hex — a fixture that is not hex tests a parser nobody ships.
+        "content_hash": hashlib.sha256(f"{vendor}{term}{value}".encode()).hexdigest(),
         "content": json.dumps(
             {
                 "vendor": vendor,
@@ -51,9 +80,11 @@ class _RecordingClient:
         existing: bool,
         fail_on: str | None = None,
         exported: str | None = None,
+        published: str | None = None,
     ) -> None:
         self._existing = existing
         self._fail_on = fail_on
+        self._published = published
         # What a later export will return. Defaults to "the edit landed correctly":
         # every instruction's own text, which contains that section's ref and value.
         self._exported = exported
@@ -66,7 +97,16 @@ class _RecordingClient:
 
     def export(self, session_id, *, fmt="markdown"):
         self.exports += 1
-        body = self._exported if self._exported is not None else "\n".join(self.instructions)
+        # First export is the reconcile read (what the document holds now); later ones
+        # are the verification read (what it holds after the writes). Modelling both as
+        # "the instructions we sent" keeps the happy path honest without simulating a
+        # document editor.
+        if self._exported is not None:
+            body = self._exported
+        elif self.exports == 1 and self._published is not None:
+            body = self._published
+        else:
+            body = "\n".join(self.instructions)
         return body.encode("utf-8")
 
     def list_documents(self, session_id):
@@ -110,8 +150,30 @@ class _RecordingClient:
 def wired(monkeypatch):
     """Point publish at fixed register data and a recording client."""
 
-    def _wire(sections, *, existing: bool, fail_on: str | None = None, exported: str | None = None):
-        client = _RecordingClient(existing=existing, fail_on=fail_on, exported=exported)
+    def _wire(
+        sections,
+        *,
+        existing: bool,
+        fail_on: str | None = None,
+        exported: str | None = None,
+        published: str | None = None,
+        synced: bool = False,
+        stale=(),
+        extra=(),
+    ):
+        # Default: the document does not yet carry these sections, so every one is
+        # written. `synced=True` models a document already holding them at their
+        # current revision; `stale` marks individual sections out of date; `extra`
+        # marks refs the document still carries that the register has dropped.
+        if published is None:
+            published = (
+                _published(sections, stale=stale, extra=extra)
+                if synced
+                else _published([], extra=extra)
+            )
+        client = _RecordingClient(
+            existing=existing, fail_on=fail_on, exported=exported, published=published
+        )
         monkeypatch.setattr(publish, "_client", lambda: client)
         monkeypatch.setattr(publish, "_corpus_name", lambda run_id: "acme")
         monkeypatch.setattr(
@@ -125,22 +187,24 @@ def wired(monkeypatch):
 
 
 class TestTheIncrementalClaim:
-    def test_only_changed_sections_are_sent(self, wired) -> None:
-        """The claim, stated as a count. Four sections, one moved, one instruction."""
+    def test_only_sections_the_document_lacks_are_sent(self, wired) -> None:
+        """The claim, stated as a count. Four sections, the document is current for
+        three, one instruction goes out."""
         sections = [
-            _section("Acme", "hourly_rate", "$195", carried=False),
-            _section("Acme", "liability_cap", "$1,000,000", carried=True),
-            _section("Acme", "notice_days", "30", carried=True),
-            _section("Acme", "governing_law", "Delaware", carried=True),
+            _section("Acme", "hourly_rate", "$195"),
+            _section("Acme", "liability_cap", "$1,000,000"),
+            _section("Acme", "notice_days", "30"),
+            _section("Acme", "governing_law", "Delaware"),
         ]
-        client = wired(sections, existing=True)
+        client = wired(sections, existing=True, synced=True, stale=["Acme::hourly_rate"])
 
         result = publish.publish("run-1")
 
         assert len(client.instructions) == 1, (
             f"one section moved, so one instruction; sent {len(client.instructions)}"
         )
-        assert "hourly_rate" in client.instructions[0]
+        assert section_ref("Acme::hourly_rate") in client.instructions[0]
+        assert "Hourly Rate" in client.instructions[0]
         assert client.uploads == [], "an incremental publish must not re-upload"
         assert result["sections_edited"] == 1
         assert result["sections_untouched"] == 3
@@ -160,13 +224,18 @@ class TestTheIncrementalClaim:
         everything_sent = " ".join(client.instructions)
         assert "liability_cap" not in everything_sent
 
-    def test_nothing_changed_spends_nothing(self, wired) -> None:
-        """The best outcome, and it must be distinguishable from a failure."""
+    def test_a_document_already_in_sync_spends_nothing(self, wired) -> None:
+        """The best outcome, and it must be distinguishable from a failure.
+
+        This is also the retry case: a second publish of the same run finds the document
+        already correct and sends nothing, where deriving the change set from run
+        provenance re-sent every re-derived section and re-paid for it.
+        """
         sections = [
-            _section("Acme", "hourly_rate", "$195", carried=True),
-            _section("Acme", "notice_days", "30", carried=True),
+            _section("Acme", "hourly_rate", "$195"),
+            _section("Acme", "notice_days", "30"),
         ]
-        client = wired(sections, existing=True)
+        client = wired(sections, existing=True, synced=True)
 
         result = publish.publish("run-1")
 
@@ -235,7 +304,7 @@ class TestReviewAndFailure:
             _section("Acme", "hourly_rate", "$195", carried=False),
             _section("Acme", "notice_days", "30", carried=False),
         ]
-        client = wired(sections, existing=True, fail_on="hourly_rate")
+        client = wired(sections, existing=True, fail_on=section_ref("Acme::hourly_rate"))
 
         result = publish.publish("run-1")
 
@@ -243,6 +312,124 @@ class TestReviewAndFailure:
         assert result["sections_edited"] == 1
         assert result["published"] is False, "a partial publish is not a success"
         assert result["failures"][0]["section_key"] == "Acme::hourly_rate"
+
+
+class TestReconcilingAgainstTheDocument:
+    """The change set comes from the published document, not from run provenance.
+
+    `carried_forward` describes what *this run* did. It cannot express "the register
+    used to have this section and no longer does", because such a section is in neither
+    the run's output nor its carried-forward set — so nothing ever mentioned it and the
+    document went on asserting a withdrawn obligation forever. And it cannot express
+    "the document already has this", so a retry re-paid for every section that had
+    already landed.
+    """
+
+    def test_a_withdrawn_obligation_is_removed_from_the_document(self, wired) -> None:
+        """The deletion path. The document carries a section the register has dropped;
+        publishing must take it out."""
+        sections = [_section("Acme", "hourly_rate", "$195")]
+        gone = "Acme::terminated_clause"
+        client = wired(sections, existing=True, synced=True, extra=[gone])
+
+        result = publish.publish("run-1")
+
+        removal = [i for i in client.instructions if "delete that section" in i]
+        assert len(removal) == 1, "the withdrawn section was never removed"
+        assert section_ref(gone) in removal[0]
+        assert result["sections_removed"] == 1
+
+    def test_a_removal_names_only_its_own_anchor(self, wired) -> None:
+        """A delete that takes a neighbouring section with it is far worse than the
+        stale section it was cleaning up."""
+        sections = [_section("Acme", "hourly_rate", "$195")]
+        gone = "Acme::terminated_clause"
+        client = wired(sections, existing=True, synced=True, extra=[gone])
+
+        publish.publish("run-1")
+        removal = next(i for i in client.instructions if "delete that section" in i)
+
+        live = set(re.findall(r"\[ref:([0-9a-f]{8})\]", removal))
+        assert live == {section_ref(gone)}
+        assert "do not match on vendor or term" in removal
+
+    def test_a_retry_after_a_partial_publish_only_sends_what_is_still_missing(
+        self, wired
+    ) -> None:
+        """The cost bug. Nineteen sections, a publish that failed on one — the retry
+        used to re-send all nineteen because they were all re-derived by that run."""
+        sections = [_section("Acme", f"term_{i}", str(i)) for i in range(19)]
+        # Eighteen landed; one did not.
+        client = wired(sections, existing=True, synced=True, stale=["Acme::term_7"])
+
+        result = publish.publish("run-1")
+
+        assert len(client.instructions) == 1, (
+            f"only the section that did not land should be re-sent; "
+            f"sent {len(client.instructions)}"
+        )
+        assert result["sections_untouched"] == 18
+
+    def test_a_section_whose_value_changed_is_rewritten(self, wired) -> None:
+        sections = [_section("Acme", "hourly_rate", "$195")]
+        client = wired(sections, existing=True, synced=True, stale=["Acme::hourly_rate"])
+
+        publish.publish("run-1")
+
+        assert len(client.instructions) == 1
+        assert section_ref("Acme::hourly_rate") in client.instructions[0]
+
+    def test_a_section_written_before_revision_markers_is_rewritten(self) -> None:
+        """An unknown revision reads as needing a rewrite — the safe direction. Assuming
+        an unmarked section is current would leave it stale forever."""
+        section = _section("Acme", "hourly_rate", "$195")
+        published = {section_ref("Acme::hourly_rate"): ""}
+
+        plan = publish.reconcile_against([section], published)
+
+        assert plan.to_write == [section]
+        assert plan.to_remove == []
+
+    def test_parsing_reads_the_revision_from_the_document(self) -> None:
+        document = (
+            "### Acme — Hourly Rate [ref:abcd1234]\n\n"
+            "The governing rate is $195.\n\n*Status: agreed. · rev 99887766*\n"
+        )
+        assert publish.parse_document(document) == {"abcd1234": "99887766"}
+
+    def test_parsing_survives_markdown_escaping(self) -> None:
+        """A round trip rewrites `_` as `\\_`; a parser that did not normalise would see
+        every section as unknown and rewrite the whole document every time."""
+        document = (
+            "### Acme — Hourly\\_Rate [ref:abcd1234]\n\n*Status: agreed. · rev 99887766*\n"
+        )
+        assert publish.parse_document(document) == {"abcd1234": "99887766"}
+
+    def test_reconciling_is_a_no_op_when_the_document_already_matches(self) -> None:
+        section = _section("Acme", "hourly_rate", "$195")
+        published = {section_ref("Acme::hourly_rate"): section["content_hash"][:8]}
+
+        plan = publish.reconcile_against([section], published)
+
+        assert plan.is_noop
+        assert plan.unchanged == 1
+
+    def test_it_refuses_rather_than_falling_back_to_run_provenance(self, wired) -> None:
+        """If the published state cannot be read, the change set cannot be computed.
+        Falling back to `carried_forward` here would silently reintroduce both bugs
+        this reconciliation exists to fix."""
+        sections = [_section("Acme", "hourly_rate", "$195")]
+        client = wired(sections, existing=True)
+
+        def _boom(session_id, *, fmt="markdown"):
+            raise SuperDocsError("export unavailable")
+
+        client.export = _boom
+
+        with pytest.raises(SuperDocsError, match="reconcile against"):
+            publish.publish("run-1")
+
+        assert client.instructions == [], "nothing may be sent on a guess"
 
 
 class TestVerifyingTheWrite:
@@ -291,7 +478,8 @@ class TestVerifyingTheWrite:
 
         result = publish.publish("run-1")
 
-        assert client.exports == 1, "the document must be read back"
+        # Two reads by design: one to work out what differs, one to confirm the writes.
+        assert client.exports == 2, "the document must be read back after writing"
         assert result["published"] is False
         assert result["verified"] is False
         assert result["mismatches"], "the mismatch must be named, not merely counted"
@@ -355,13 +543,22 @@ class TestVerifyingTheWrite:
 
     def test_being_unable_to_verify_is_not_recorded_as_verified(self, wired) -> None:
         """"I could not check" must never be downgraded to "this is fine"."""
-        sections = [_section("Acme", "hourly_rate", "$195", carried=False)]
+        sections = [_section("Acme", "hourly_rate", "$195")]
         client = wired(sections, existing=True)
 
-        def _boom(session_id, *, fmt="markdown"):
+        # Fails on the *verification* read only. The first export is the reconcile read,
+        # and without it there is no change set at all — a different failure, covered
+        # separately.
+        real_export = client.export
+        calls = {"n": 0}
+
+        def _boom_on_verify(session_id, *, fmt="markdown"):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_export(session_id, fmt=fmt)
             raise SuperDocsError("export unavailable")
 
-        client.export = _boom
+        client.export = _boom_on_verify
 
         result = publish.publish("run-1")
 
@@ -437,7 +634,7 @@ class TestItDoesNotOverstateWhatHappened:
         """Nothing landed, so there is nothing to confirm — which is not the same as
         confirmed. This reported `verified: true` for a total failure."""
         sections = [_section("Acme", "hourly_rate", "$195", carried=False)]
-        wired(sections, existing=True, fail_on="hourly_rate")
+        wired(sections, existing=True, fail_on=section_ref("Acme::hourly_rate"))
 
         result = publish.publish("run-1")
 
@@ -553,6 +750,54 @@ class TestDegradingHonestly:
             publish.publish("run-1")
 
 
+class TestTermsReadAsProse:
+    """A published register is a document, and a document does not say
+    `sla_credit_percent`. Predicates are the right shape for a section key and the
+    wrong shape for something a person reads."""
+
+    def test_underscores_become_words(self) -> None:
+        assert humanise_term("hourly_rate") == "Hourly Rate"
+        assert humanise_term("liability_cap") == "Liability Cap"
+        assert humanise_term("governing_law") == "Governing Law"
+
+    def test_trailing_units_become_parentheticals(self) -> None:
+        """`payment_terms_days` names a quantity in days. "Payment Terms Days" reads
+        like a column header nobody renamed."""
+        assert humanise_term("payment_terms_days") == "Payment Terms (days)"
+        assert humanise_term("auto_renew_months") == "Auto Renew (months)"
+        assert humanise_term("sla_credit_percent") == "SLA Credit (%)"
+
+    def test_acronyms_are_not_title_cased_into_words(self) -> None:
+        assert humanise_term("sla_credit_percent").startswith("SLA")
+        assert "Sla" not in humanise_term("sla_credit_percent")
+
+    def test_a_unit_word_that_is_the_subject_is_not_stripped(self) -> None:
+        """`invoice_hours` is hours *on the invoice*, not a quantity in hours — so
+        `hours` is deliberately not in the unit list."""
+        assert humanise_term("invoice_hours") == "Invoice Hours"
+
+    def test_it_survives_a_single_word_and_an_empty_string(self) -> None:
+        assert humanise_term("vendor") == "Vendor"
+        assert humanise_term("") == ""
+
+    def test_the_published_document_uses_the_prose_form(self) -> None:
+        section = _section("Acme", "payment_terms_days", "30", carried=False)
+        rendered = render_section(section)
+
+        assert "Payment Terms (days)" in rendered
+        assert "payment_terms_days" not in rendered
+
+    def test_relabelling_does_not_move_a_section_identity(self) -> None:
+        """The anchor is derived from the section key, not the label. If a reworded
+        heading changed the ref, every section would look edited and the incremental
+        claim would collapse the first time someone improved the wording."""
+        key = "Acme::payment_terms_days"
+        assert section_ref(key) == section_ref(key)
+
+        section = _section("Acme", "payment_terms_days", "30", carried=False)
+        assert f"[ref:{section_ref(section['section_key'])}]" in render_section(section)
+
+
 class TestRendering:
     def test_rendering_is_deterministic(self) -> None:
         """Publishing compares a freshly rendered section against what SuperDocs holds.
@@ -572,7 +817,7 @@ class TestRendering:
         rendered = render_section(section)
 
         assert "No supported value" in rendered
-        assert "governing_law" in rendered
+        assert "Governing Law" in rendered
 
     def test_superseded_values_are_kept_as_evidence(self) -> None:
         section = {
@@ -596,6 +841,6 @@ class TestRendering:
         ]
         document = render_register({"sections": sections}, corpus_name="acme", run_id="abcd1234")
 
-        assert "hourly_rate" in document
-        assert "notice_days" in document
+        assert "Hourly Rate" in document
+        assert "Notice (days)" in document
         assert document.startswith("# Vendor Obligation & Exposure Register")

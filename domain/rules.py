@@ -25,7 +25,7 @@ from typing import Any
 
 import yaml
 
-from domain.normalize import normalize
+from domain.normalize import normalize, why_not_comparable
 from domain.reconcile import Resolution
 
 RULE_KINDS = {"numeric_max", "numeric_min", "numeric_bound", "presence_required"}
@@ -58,6 +58,26 @@ class RuleViolation:
     observed: str | None
     explanation: str
     fact_id: object | None = None
+    # False when the rule could not be run at all, as opposed to run and breached.
+    checked: bool = True
+
+    @property
+    def severity(self) -> str:
+        """The severity to report this at, which is not always the rule's own.
+
+        Three of seven `high` findings in a live run were variations of "LIAB-01 could
+        not be evaluated ... Not checked." The honesty was right and the severity was
+        wrong: "I could not check this" is not the same class of event as "this is
+        breached", and putting it at the rule's own severity pushed three non-findings
+        to the top of the review queue. A reviewer who sees that twice learns to skim
+        the high band, which costs more than the rule buys.
+
+        Reported at `low` instead. The coverage gap it represents is real, but it is a
+        property of the corpus rather than of the contract, so it belongs in the run's
+        metrics — `examine` counts these separately — rather than at the top of a queue
+        ordered by consequence.
+        """
+        return self.rule.severity if self.checked else "low"
 
 
 def load_rules(path: Path) -> tuple[str, list[Rule]]:
@@ -243,6 +263,27 @@ def evaluate(rules: list[Rule], resolutions: list[Resolution]) -> list[RuleViola
 
             observed = magnitudes.get(rule.predicate)
             if observed is None:
+                # A value exists but has no magnitude — a liability cap written as a
+                # formula, or a string the normalizer refused. This used to `continue`
+                # silently, and a silent skip is indistinguishable from a pass: Talus
+                # dropped out of three playbook checks between two runs and the register
+                # gave no sign of it. Now it is reported, at "not checked" severity, and
+                # says which of the two happened.
+                raw = resolution.governing.value_raw
+                violations.append(
+                    RuleViolation(
+                        rule=rule,
+                        subject=vendor,
+                        observed=raw,
+                        explanation=(
+                            f"{rule.code} could not be evaluated for {vendor}: the "
+                            f"recorded {rule.predicate} {raw!r} is "
+                            f"{why_not_comparable(rule.predicate, raw)}. Not checked."
+                        ),
+                        fact_id=resolution.governing.fact_id,
+                        checked=False,
+                    )
+                )
                 continue
 
             limit: Decimal | None
@@ -272,6 +313,7 @@ def evaluate(rules: list[Rule], resolutions: list[Resolution]) -> list[RuleViola
                                 f"corpus does not supply. Not checked."
                             ),
                             fact_id=resolution.governing.fact_id,
+                            checked=False,
                         )
                     )
                     continue

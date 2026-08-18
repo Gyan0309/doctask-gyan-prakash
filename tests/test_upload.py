@@ -16,16 +16,28 @@ import main
 from services.watcher import Watcher
 
 
-def _client(tmp_path, monkeypatch) -> TestClient:
-    """A live watcher over tmp_path, with runs stubbed out.
+def _client(tmp_path, monkeypatch, *, record: list | None = None) -> TestClient:
+    """A live watcher over tmp_path, with the run itself stubbed out.
 
-    `start_run=None` makes `poll()` report what it found without starting anything, so
-    these tests stay fast and keyless while still exercising the real endpoint.
+    The stub still calls `on_started`, because that callback is what lets the endpoint
+    answer without waiting out the whole run — the behaviour most worth protecting
+    here. It records the paths it was handed so a test can assert the handoff really
+    happened rather than inferring it from a status string.
     """
+
+    def _fake_start_run(*, corpus_name, document_paths, on_started=None, **kwargs):
+        if record is not None:
+            record.extend(document_paths)
+        if on_started is not None:
+            on_started("11111111-2222-3333-4444-555555555555")
+        return {"run_id": "11111111-2222-3333-4444-555555555555"}
+
     settings = main.get_settings()
     monkeypatch.setattr(settings, "watch_dir", tmp_path)
     monkeypatch.setattr(
-        main, "_watcher", Watcher(tmp_path, corpus_name="test", start_run=None)
+        main,
+        "_watcher",
+        Watcher(tmp_path, corpus_name="test", start_run=_fake_start_run),
     )
     return TestClient(main.app)
 
@@ -45,18 +57,41 @@ class TestAcceptedUploads:
         assert response.json()["saved"] == ["msa.md"]
         assert (tmp_path / "msa.md").read_bytes() == b"# Master Services Agreement"
 
-    def test_the_upload_is_reported_to_the_watcher_not_ingested_separately(
+    def test_the_upload_is_handed_to_the_watcher_not_ingested_separately(
         self, tmp_path, monkeypatch
     ) -> None:
-        """The file must come back as something the watcher *found*. If it did not,
+        """The uploaded file must reach the run through the watcher. If it did not,
         the upload wrote to a directory nothing is looking at."""
-        client = _client(tmp_path, monkeypatch)
+        handed: list[str] = []
+        client = _client(tmp_path, monkeypatch, record=handed)
 
-        response = client.post(
+        client.post(
             "/documents/upload", files={"files": ("a.md", b"contract", "text/markdown")}
         )
 
-        assert response.json()["added"] == ["a.md"]
+        assert any(p.endswith("a.md") for p in handed), (
+            f"the run was never handed the uploaded file; got {handed}"
+        )
+
+    def test_it_answers_with_a_run_id_rather_than_waiting_out_the_run(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Holding the request open for the whole run was honest and unusable: a cold
+        corpus is a minute of a dropzone saying nothing, and the page cannot show the
+        stages it is waiting on because it is blocked on the same request.
+
+        The id exists the moment the run row is inserted, so that is when the caller
+        gets it — and the page polls from there.
+        """
+        client = _client(tmp_path, monkeypatch)
+
+        body = client.post(
+            "/documents/upload", files={"files": ("a.md", b"contract", "text/markdown")}
+        ).json()
+
+        assert body["run_id"], "the caller needs an id it can poll"
+        assert body["status"] == "running"
+        assert body["poll"] == f"/runs/{body['run_id']}"
 
     def test_several_documents_arrive_together(self, tmp_path, monkeypatch) -> None:
         client = _client(tmp_path, monkeypatch)

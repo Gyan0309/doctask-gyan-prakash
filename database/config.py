@@ -94,6 +94,18 @@ class Settings(BaseSettings):
     # skipped and a finding is emitted. Skipping loudly beats extracting garbage.
     extract_max_retries: int = 2
 
+    # Our own organisation's name, as it appears in the agreements we are a party to.
+    #
+    # Nothing checked whether an ingested document was *ours*. A subcontractor's
+    # agreement between two other companies — found in a scanned corpus — was read
+    # correctly, classified correctly, and silently added a vendor to the register that
+    # is not a counterparty at all. Every downstream stage then treated its terms as
+    # obligations of ours.
+    #
+    # Empty by default and reported as unchecked when empty. Inventing a name would be a
+    # guess about the deployment, and a wrong one would flag the entire corpus.
+    organisation_name: str = ""
+
     @property
     def is_fake_provider(self) -> bool:
         return self.llm_provider.lower() == "fake"

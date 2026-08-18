@@ -61,8 +61,8 @@ Override with `DB_HOST_PORT` if 55432 is also taken.
 ## Tests
 
 ```bash
-pytest                      # 224 tests
-pytest -m "not integration" # 130 of them need no database either
+pytest                      # 414 tests
+pytest -m "not integration" # 332 of them need no database either
 ```
 
 **Every test runs with no API key, no network, and no recorded fixtures.** CI holds no
@@ -183,9 +183,21 @@ curl -X POST localhost:8000/runs/<run_id>/publish
 ```
 
 The first publish for a corpus uploads the whole document. Every publish after that
-sends **one instruction per changed section** and approves each proposed change
-individually. That is the same claim the rest of this system makes, aimed at someone
-else's API: an update costs like an update.
+**exports the document, diffs it against the register, and sends only the difference** —
+one instruction per section that differs, one per section the register has dropped, each
+change approved individually. That is the same claim the rest of this system makes,
+aimed at someone else's API: an update costs like an update.
+
+The change set comes from the *document*, not from what the run re-derived, and that
+distinction does real work. `carried_forward` cannot express "the register used to have
+this section and no longer does" — such a section is in neither the run's output nor its
+carried-forward set, so nothing would ever mention it and the document would assert a
+withdrawn obligation forever. Nor can it express "the document already has this", so a
+retry re-paid for every section that had already landed. Sections carry a `rev` marker
+(the first eight of their content hash), so both questions are one exact comparison.
+
+If the document cannot be read, publishing **refuses** rather than falling back to run
+provenance — a fallback there would silently reintroduce both bugs.
 
 Measured live against `api.superdocs.app`:
 
@@ -193,7 +205,16 @@ Measured live against `api.superdocs.app`:
 |---|---|
 | First publish | 19 sections uploaded, 3 API calls |
 | Second publish, after one amendment | **1 section edited, 18 untouched** |
+| Republish with nothing changed | **no-op — 2 API calls, 0 operations** |
+| Reconciling a 19-section document down to a 4-section register | **19 removed, 4 written**, 4833 → 1109 bytes |
 | Verified against the exported document | ✅ |
+
+That last row also produced the most useful failure in the project. Into a session that
+had just processed nineteen deletions, an explicit *"reproduce it verbatim"* instruction
+came back with the values replaced by **template placeholders** — `Please fill: Annual
+Fee Amount` — and one real value written into the neighbouring section. Every status
+code was 200 and every count was right. The verification caught it, reported
+`published: false`, and named the section. Written up for SuperDocs as finding #11.
 
 `session_id` is caller-chosen, so it is derived from the corpus name and used as an
 idempotency handle — republishing continues the *same document* rather than littering

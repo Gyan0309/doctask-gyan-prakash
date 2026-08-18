@@ -26,6 +26,24 @@ from sqlalchemy.orm import Session
 from models import Claim, ClaimCitation, SectionDependency, SectionVersion
 from utils.hashing import content_hash, stable_json
 
+# Bumped when the *derivation* of a section changes, as distinct from the facts behind it.
+#
+# The invalidation rule was "same facts, reuse the bytes", and that is wrong in one
+# specific and damaging way: a section's content is derived from its facts, so changing the
+# derivation changes the answer while the fact set stays identical. Found live. Teaching the
+# reconciler that a renewal notice restates rather than governs was correct, tested, and
+# deployed — and the register went on reporting `net forty-five (45) days` sourced from the
+# renewal notice, because the affected sections carried forward untouched. The fix looked
+# inert for the same structural reason a prompt fix looks inert when facts are reused, one
+# layer up.
+#
+# This is the honest counterweight to incrementality: reuse has to be invalidated by
+# everything the output depends on, and the logic is one of those things.
+#
+# v2: renewal notices no longer govern; SOW scopes are named rather than numbered.
+# v3: a vendor's display name is chosen once for the whole register rather than per row.
+COMPOSER_VERSION = "compose-v3"
+
 
 @dataclass(frozen=True)
 class SectionPlan:
@@ -103,9 +121,16 @@ def plan_recomposition(
       - there is no previous run (the degenerate full-run case)
       - it has no version in the previous run (it is new)
       - its dependency set differs from what was recorded
+      - the previous version was produced by different derivation logic
 
-    Note what is deliberately *not* a trigger: the content being different. Content is
-    an output of composition, so consulting it would require composing first, which is
+    The last one is the subtle one and it was missing. Content is derived *from* facts, so
+    identical facts do not imply an identical answer — change how governance is decided and
+    every affected section is stale while its dependency set is untouched. Measured: a
+    reconciliation fix landed, was tested, and changed nothing in the register, because
+    every section it applied to carried forward.
+
+    Note what is deliberately still *not* a trigger: the content being different. Content
+    is an output of composition, so consulting it would require composing first, which is
     the cost we are avoiding.
     """
     plan = RecompositionPlan()
@@ -114,17 +139,20 @@ def plan_recomposition(
         plan.rederive = list(desired)
         return plan
 
-    previous_keys = set(
-        session.execute(
-            select(SectionVersion.section_key).where(SectionVersion.run_id == prev_run_id)
-        )
-        .scalars()
-        .all()
-    )
+    previous = {
+        sv.section_key: sv
+        for sv in session.execute(
+            select(SectionVersion).where(SectionVersion.run_id == prev_run_id)
+        ).scalars()
+    }
     recorded = load_recorded_dependencies(session, [s.section_key for s in desired])
 
     for section in desired:
-        if section.section_key not in previous_keys:
+        prior = previous.get(section.section_key)
+        if prior is None:
+            plan.rederive.append(section)
+            continue
+        if prior.composer_version != COMPOSER_VERSION:
             plan.rederive.append(section)
             continue
         if recorded.get(section.section_key, set()) != set(section.fact_ids):
@@ -182,6 +210,7 @@ def apply_plan(
             if section.section_key in previous
             else None,
             carried_forward=False,
+            composer_version=COMPOSER_VERSION,
         )
         session.add(version)
         session.flush()
@@ -226,6 +255,10 @@ def apply_plan(
             content_hash=prior.content_hash,  # copied, never recomputed
             prev_version_id=prior.id,
             carried_forward=True,
+            # The version that produced these bytes, carried with them. Stamping the
+            # current version onto copied content would claim the current logic produced
+            # it, and the next derivation change would then find nothing to invalidate.
+            composer_version=prior.composer_version,
         )
         session.add(version)
         session.flush()

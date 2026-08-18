@@ -11,6 +11,21 @@
  */
 import Publish from "./Publish.jsx";
 
+// Mirrors domain/render.py's humanise_term. Predicates are identifiers — the right
+// shape for a section key and the wrong shape for something a person reads.
+const ACRONYMS = new Set(["sla", "msa", "sow", "kpi", "vat", "id"]);
+const UNITS = { days: "days", months: "months", years: "years", percent: "%" };
+
+function humaniseTerm(term) {
+  if (!term) return "";
+  const parts = term.split("_").filter(Boolean);
+  const unit = parts.length > 1 ? UNITS[parts[parts.length - 1].toLowerCase()] : undefined;
+  const words = (unit ? parts.slice(0, -1) : parts).map((p) =>
+    ACRONYMS.has(p.toLowerCase()) ? p.toUpperCase() : p[0].toUpperCase() + p.slice(1),
+  );
+  return unit ? `${words.join(" ")} (${unit})` : words.join(" ");
+}
+
 export default function Register({ runId, deliverable, changes, selectedKey, onSelect }) {
   if (!deliverable) return null;
 
@@ -72,7 +87,14 @@ export default function Register({ runId, deliverable, changes, selectedKey, onS
                 onClick={() => onSelect(section.section_key)}
               >
                 <td>{row.vendor}</td>
-                <td>{row.term}</td>
+                {/* Raw predicate kept in the tooltip — it is what the API and the
+                    section key use, so anyone debugging still needs it. */}
+                <td title={row.term}>
+                  {humaniseTerm(row.term)}
+                  {/* Which rate-card row this is. Five grades all labelled "Hourly
+                      Rate" with different values is unreadable. */}
+                  {row.scope && <span className="scope">{row.scope}</span>}
+                </td>
                 <td>
                   {row.value ?? <span style={{ color: "var(--faint)" }}>—</span>}
                   {row.superseded?.length > 0 && (

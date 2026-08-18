@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -123,6 +124,7 @@ def start_run(
     corpus_name: str,
     document_paths: list[str | Path],
     thread_id: str | None = None,
+    on_started: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Start a run and drive it until it completes or parks at the gate.
 
@@ -149,6 +151,12 @@ def start_run(
         session.add(run)
         session.flush()
         run_id = str(run.id)
+
+    # Announce the id before the graph runs, so a caller that does not want to wait out
+    # the whole run still has something to poll. A run takes as long as the model takes;
+    # holding an HTTP request open for it is a choice the caller should get to make.
+    if on_started is not None:
+        on_started(run_id)
 
     graph = build_graph(get_checkpointer())
     config = {"configurable": {"thread_id": thread_id or run_id}}
@@ -243,6 +251,35 @@ class ResumeFailed(RuntimeError):
     that has moved since the run started. The run stays resumable."""
 
 
+def known_document_hashes(corpus_name: str) -> dict[str, str]:
+    """Filename → content hash for every document already ingested into a corpus.
+
+    The watcher's "what have I seen" lives in memory, so a restart made every file in the
+    inbox look new: a poll after restarting reported "36 added" when nothing had been
+    added, and started a run for it. The run itself was harmless — documents dedupe on
+    hash and facts are reused, so it cost no model calls — but the report was false, and a
+    system that says thirty-six documents arrived when none did is the failure mode this
+    project keeps finding.
+
+    `prime()` existed for exactly this and read the *filesystem*, which is the wrong
+    source and has its own bug: on a genuinely fresh deployment it marks an inbox full of
+    unprocessed documents as already seen, and they are never ingested at all. The
+    database is the right source, because "have I seen this" is a question about what was
+    ingested, not about what is on disk. Both cases then come out correct — after a
+    restart nothing is new, and on a fresh deployment everything is.
+    """
+    with session_scope() as session:
+        corpus = session.execute(
+            select(Corpus).where(Corpus.name == corpus_name)
+        ).scalar_one_or_none()
+        if corpus is None:
+            return {}
+        rows = session.execute(
+            select(Document.uri, Document.sha256).where(Document.corpus_id == corpus.id)
+        ).all()
+    return {basename(uri): digest for uri, digest in rows}
+
+
 def mark_interrupted_runs() -> int:
     """At startup, no run can still be in flight — so any row claiming otherwise lied.
 
@@ -263,6 +300,12 @@ def mark_interrupted_runs() -> int:
 
         for run in orphans:
             run.status = "interrupted"
+            # The stage it died in is kept as `stage_detail` — it is the most useful
+            # thing to know about an interrupted run — but `current_stage` is cleared,
+            # because nothing is currently executing it.
+            if run.current_stage:
+                run.stage_detail = f"died during {run.current_stage}"
+            run.current_stage = None
 
         count = len(orphans)
 
@@ -336,13 +379,30 @@ def _describe(run_id: str, state: dict[str, Any], config: dict[str, Any]) -> dic
     snapshot = graph.get_state(config)
     awaiting = bool(snapshot.next) and "gate" in snapshot.next
 
+    # The escalation gate, surfaced the same way the review gate is.
+    #
+    # This only read `gate` interrupts, which was survivable while the escalation branch
+    # never fired: it had not fired once across four runs and twenty-nine documents. The
+    # moment it did, a run parked there reported plain `running` with nothing pending and
+    # no question anywhere — the API had a human gate the API could not answer. A branch
+    # that becomes reachable has to become answerable in the same change.
+    awaiting_classification = bool(snapshot.next) and "escalate" in snapshot.next
+
     pending: list[dict[str, Any]] = []
-    if awaiting:
-        for task in snapshot.tasks:
-            for intr in getattr(task, "interrupts", ()) or ():
-                value = getattr(intr, "value", None)
-                if isinstance(value, dict):
-                    pending = value.get("findings", [])
+    escalations: list[dict[str, Any]] = []
+    options: list[str] = []
+    option_effects: list[dict[str, Any]] = []
+    for task in snapshot.tasks:
+        for intr in getattr(task, "interrupts", ()) or ():
+            value = getattr(intr, "value", None)
+            if not isinstance(value, dict):
+                continue
+            if value.get("kind") == "classify_documents":
+                escalations = value.get("documents", [])
+                options = value.get("options", [])
+                option_effects = value.get("option_effects", [])
+            else:
+                pending = value.get("findings", [])
 
     # A blocked run reports blocked, never "completed". I5: a success message must
     # mean the output is genuinely in the state claimed.
@@ -350,6 +410,8 @@ def _describe(run_id: str, state: dict[str, Any], config: dict[str, Any]) -> dic
         status = "blocked_by_verification"
     elif awaiting:
         status = "awaiting_review"
+    elif awaiting_classification:
+        status = "awaiting_classification"
     else:
         status = state.get("status", "unknown")
 
@@ -357,6 +419,10 @@ def _describe(run_id: str, state: dict[str, Any], config: dict[str, Any]) -> dic
         "run_id": run_id,
         "status": status,
         "awaiting_review": awaiting,
+        "awaiting_classification": awaiting_classification,
+        "escalations": escalations,
+        "classification_options": options,
+        "classification_option_effects": option_effects,
         "verification": state.get("verification", {}),
         "pending_findings": pending,
         "plan": state.get("plan_summary", {}),
@@ -382,6 +448,12 @@ def get_run(run_id: str) -> dict[str, Any]:
             "run_id": run_id,
             "status": run.status,
             "mode": run.mode,
+            # Where the run is right now. Stage metrics are only written when a stage
+            # *finishes*, so without this a two-minute run reports "running" and one
+            # completed line for ninety seconds, and a caller cannot tell work from a
+            # hang.
+            "current_stage": run.current_stage,
+            "stage_detail": run.stage_detail,
             "started_at": run.started_at.isoformat(),
             "ended_at": run.ended_at.isoformat() if run.ended_at else None,
             "stages": [
@@ -407,16 +479,36 @@ def get_run(run_id: str) -> dict[str, Any]:
     # that happened to trigger it.
     result["awaiting_review"] = False
     result["pending_findings"] = []
-    if result["status"] == "awaiting_review":
+    result["awaiting_classification"] = False
+    result["escalations"] = []
+    result["classification_options"] = []
+    result["classification_option_effects"] = []
+
+    # Read whenever the run is unfinished, not only when the status column says
+    # `awaiting_review`. The escalation gate does not set a status of its own — it pauses
+    # mid-pipeline with the row still reading `running` — so gating this read on the
+    # status would leave the same blind spot the review gate had: a live question that no
+    # page reload could ever find.
+    if result["status"] in ("running", "awaiting_review"):
         graph = build_graph(get_checkpointer())
         snapshot = graph.get_state({"configurable": {"thread_id": run_id}})
-        if snapshot.next and "gate" in snapshot.next:
-            for task in snapshot.tasks:
-                for intr in getattr(task, "interrupts", ()) or ():
-                    value = getattr(intr, "value", None)
-                    if isinstance(value, dict):
-                        result["awaiting_review"] = True
-                        result["pending_findings"] = value.get("findings", [])
+        nxt = set(snapshot.next or ())
+        for task in snapshot.tasks:
+            for intr in getattr(task, "interrupts", ()) or ():
+                value = getattr(intr, "value", None)
+                if not isinstance(value, dict):
+                    continue
+                if value.get("kind") == "classify_documents" and "escalate" in nxt:
+                    result["awaiting_classification"] = True
+                    result["status"] = "awaiting_classification"
+                    result["escalations"] = value.get("documents", [])
+                    result["classification_options"] = value.get("options", [])
+                    result["classification_option_effects"] = value.get(
+                        "option_effects", []
+                    )
+                elif "gate" in nxt:
+                    result["awaiting_review"] = True
+                    result["pending_findings"] = value.get("findings", [])
 
     return result
 
@@ -489,6 +581,8 @@ def list_runs(limit: int = 25) -> list[dict[str, Any]]:
                 "corpus": corpus_name,
                 "status": run.status,
                 "mode": run.mode,
+                "current_stage": run.current_stage,
+                "stage_detail": run.stage_detail,
                 "started_at": run.started_at.isoformat(),
                 "ended_at": run.ended_at.isoformat() if run.ended_at else None,
             }

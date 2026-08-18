@@ -34,6 +34,40 @@ def section_ref(section_key: str) -> str:
     return hashlib.sha256(section_key.encode("utf-8")).hexdigest()[:8]
 
 
+# Words that are acronyms rather than words, and must not be title-cased into "Sla".
+_ACRONYMS = {"sla", "msa", "sow", "kpi", "vat", "id", "sos"}
+
+# Trailing units. `payment_terms_days` names a quantity *in days*; carrying that into
+# the label as a parenthetical reads like a document, where "Payment Terms Days" reads
+# like a column header someone forgot to rename.
+_UNITS = {"days": "days", "months": "months", "years": "years", "percent": "%"}
+
+
+def humanise_term(term: str) -> str:
+    """A predicate name as a person would write it.
+
+    Predicates are identifiers — `payment_terms_days`, `sla_credit_percent` — and they
+    are the right shape for a section key, a dependency map and an API. They are the
+    wrong shape for a document. Publishing them raw is the tell that a "document" is
+    really a table that has been printed out.
+
+    The identifier is untouched: this only changes what is *displayed*. Section keys,
+    `[ref:…]` anchors and the dependency map all still key on the original, so nothing
+    about identity or addressing moves when a label is reworded.
+    """
+    if not term:
+        return ""
+
+    parts = [p for p in term.split("_") if p]
+    unit = _UNITS.get(parts[-1].lower()) if len(parts) > 1 else None
+    if unit:
+        parts = parts[:-1]
+
+    words = [p.upper() if p.lower() in _ACRONYMS else p.capitalize() for p in parts]
+    label = " ".join(words)
+    return f"{label} ({unit})" if unit else label
+
+
 def _row(section: dict[str, Any]) -> dict[str, Any]:
     """The section's content, parsed. Sections store canonical JSON."""
     try:
@@ -63,17 +97,22 @@ def render_section(section: dict[str, Any]) -> str:
 
     # The ref is what makes this section addressable. It sits in the heading so it
     # survives the markdown → HTML → markdown round trip as ordinary text.
-    lines = [f"### {vendor} — {term} [ref:{section_ref(key)}]", ""]
+    label = humanise_term(term)
+    # A rate-card row is only meaningful next to which row it is.
+    scope = (row.get("scope") or "").strip()
+    if scope:
+        label = f"{label} — {scope.title()}"
+    lines = [f"### {vendor} — {label} [ref:{section_ref(key)}]", ""]
 
     if value is None:
         # An absent value is stated, never quietly omitted. A register that drops the
         # terms it could not establish reads as complete and is not.
         lines.append(
-            f"No supported value for **{term}** was established for {vendor}. "
+            f"No supported value for **{label}** was established for {vendor}. "
             "This is recorded rather than omitted."
         )
     else:
-        sentence = f"The governing **{term}** for {vendor} is **{value}**"
+        sentence = f"The governing **{label}** for {vendor} is **{value}**"
         if effective:
             sentence += f", effective {effective}"
         if source:
@@ -88,7 +127,14 @@ def render_section(section: dict[str, Any]) -> str:
             )
 
     lines.append("")
-    lines.append(f"*Status: {status}.*")
+    # The revision marker is what makes publishing a *reconciliation* rather than a
+    # replay. With it, "does the document already hold this section's current content?"
+    # is an exact comparison against the register's own content hash — the same hash
+    # the incrementality claim is measured with. Without it the only available check is
+    # whether the value string appears somewhere in the section, which misses a changed
+    # effective date, a changed governing source, or a changed supersession chain.
+    rev = str(section.get("content_hash") or "")[:8]
+    lines.append(f"*Status: {status}.{f' · rev {rev}' if rev else ''}*")
     return "\n".join(lines)
 
 

@@ -33,3 +33,4 @@ exports/
 inbox/
 .DS_Store
 Thumbs.db
+corpus/*

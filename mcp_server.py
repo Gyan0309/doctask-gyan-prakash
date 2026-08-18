@@ -135,7 +135,16 @@ def get_deliverable(
 @server.tool()
 def get_provenance(
     run_id: Annotated[str, Field(description="The run's UUID.")],
-    section_key: Annotated[str, Field(description="Section key, e.g. 'Acme Corp::hourly_rate'.")],
+    section_key: Annotated[
+        str,
+        Field(
+            description=(
+                "Section key as it appears in the deliverable, e.g. "
+                "'acme corp::hourly_rate'. Keys are folded to lower case: they are "
+                "identity, not display text, so a vendor's spelling cannot change them."
+            )
+        ),
+    ],
 ) -> dict[str, Any]:
     """Where one row of the register came from: its claim, and every citation behind
     it with the exact source passage.

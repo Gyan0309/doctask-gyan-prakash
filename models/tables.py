@@ -164,6 +164,15 @@ class Fact(Base):
     value_norm: Mapped[str | None] = mapped_column(Text)
     unit: Mapped[str | None] = mapped_column(String(30))
 
+    # Which row of a rate card, tier or schedule this value belongs to — "Partner",
+    # "out-of-hours", "Grade 3". NULL means it governs the agreement as a whole.
+    #
+    # Without this, a five-row rate card is five competing values for one predicate:
+    # every pair is a conflict candidate and the governing value is whichever fact
+    # sorted last. Measured on a real engagement letter, that made the *paralegal* rate
+    # the vendor's headline rate while the partner rate sat in the same table.
+    qualifier: Mapped[str | None] = mapped_column(String(120))
+
     effective_date: Mapped[date | None] = mapped_column(Date)
     confidence: Mapped[float | None] = mapped_column(Float)
     extractor_version: Mapped[str] = mapped_column(String(40), nullable=False)
@@ -219,6 +228,18 @@ class SectionVersion(Base):
     # The proof mechanism. "Untouched" is a hash comparison between two versions,
     # not a narrative claim in a README.
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # Which version of the derivation logic produced this content.
+    #
+    # Invalidation used to key on fact identity alone: same facts, therefore reuse the
+    # bytes. But a section's content is derived *from* those facts, and changing the
+    # derivation changes the answer without changing a single fact. Found live — teaching
+    # the reconciler that a renewal notice does not govern left every affected section
+    # carrying its old, wrong answer, because the fact set behind it was identical.
+    #
+    # Nullable so rows written before this existed compare unequal to any current version
+    # and are re-derived once, which is the safe direction.
+    composer_version: Mapped[str | None] = mapped_column(String(40))
 
     prev_version_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("section_version.id", ondelete="SET NULL")
@@ -411,6 +432,16 @@ class Run(Base):
     # code path is identical, and a full run is the case where every section happens
     # to be invalid.
     mode: Mapped[str] = mapped_column(String(20), nullable=False, default="incremental")
+
+    # Where the run is right now, written on entry to each node.
+    #
+    # Cost metrics are written when a stage *finishes*, so for ninety of the hundred and
+    # forty-five seconds a real run took, the page showed "running · 0 rows" with one
+    # completed line and nothing else. There was no way to tell "extracting the second of
+    # three documents" from "hung" — and a single extract call on a 23 KB MSA takes nearly
+    # forty seconds on its own, so waiting quietly is the normal case, not a symptom.
+    current_stage: Mapped[str | None] = mapped_column(String(40))
+    stage_detail: Mapped[str | None] = mapped_column(String(200))
 
     started_at: Mapped[datetime] = _now()
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

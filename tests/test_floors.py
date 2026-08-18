@@ -24,7 +24,7 @@ from sqlalchemy.engine import Engine
 
 import services.service as service
 from database.db import session_scope
-from models import Decision, Fact, Finding, Run, SectionVersion, StageMetric
+from models import Decision, Document, Fact, Finding, Run, SectionVersion, StageMetric
 from services.graph import build_graph
 
 pytestmark = pytest.mark.integration
@@ -810,6 +810,57 @@ class TestConcurrentRunsAreIsolated:
             keys = [s["section_key"] for s in sections]
             assert len(keys) == len(set(keys)), f"run {label} has duplicate sections"
 
+    @pytest.mark.slow
+    def test_twenty_runs_at_once_on_one_corpus(self, tmp_path) -> None:
+        """Two runs is a race that usually does not happen; twenty is one that does.
+
+        Both check-then-insert races this project has hit — `ensure_corpus` and document
+        ingestion — were found by concurrency tests and only ever fired on an unlucky
+        interleaving. At two threads the window is narrow enough that a broken build can
+        pass; at twenty, all of them contend on the same corpus row, the same document
+        hashes and the same section keys on the first statement each executes.
+
+        Asserts on evidence a lost update cannot fake: every run completed, every run
+        produced a register, and no run's register contains the same section twice.
+        """
+        (tmp_path / "msa.md").write_text(MSA, encoding="utf-8")
+        (tmp_path / "amendment.md").write_text(AMENDMENT, encoding="utf-8")
+        corpus = _unique("concurrent20")
+        paths = [str(tmp_path / "msa.md"), str(tmp_path / "amendment.md")]
+
+        results: dict[int, dict] = {}
+        errors: list[Exception] = []
+        lock = threading.Lock()
+
+        def _run(index: int) -> None:
+            try:
+                outcome = _complete(
+                    service.start_run(corpus_name=corpus, document_paths=paths)
+                )
+                with lock:
+                    results[index] = outcome
+            except Exception as exc:
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=_run, args=(i,)) for i in range(20)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=300)
+
+        assert not errors, f"{len(errors)} of 20 concurrent runs raised: {errors[:3]}"
+        assert len(results) == 20, f"only {len(results)} of 20 runs completed"
+
+        run_ids = {r["run_id"] for r in results.values()}
+        assert len(run_ids) == 20, "runs must not share an id"
+
+        for index, result in results.items():
+            sections = service.get_deliverable(result["run_id"])["sections"]
+            assert sections, f"run {index} produced no register"
+            keys = [s["section_key"] for s in sections]
+            assert len(keys) == len(set(keys)), f"run {index} has duplicate sections"
+
     def test_each_run_has_its_own_thread_and_its_own_versions(self, tmp_path) -> None:
         """`thread_id` is the isolation boundary. Two runs sharing one would resume
         into each other's checkpoints."""
@@ -838,3 +889,217 @@ class TestConcurrentRunsAreIsolated:
                 )
                 keys = [v.section_key for v in versions]
                 assert len(keys) == len(set(keys)), "one version per section per run"
+
+
+# ---------------------------------------------------------------------------
+# The escalation gate — reachable, and therefore answerable
+# ---------------------------------------------------------------------------
+
+
+class TestTheClassificationGateCanBeAnswered:
+    """This gate had never fired.
+
+    Across four live runs and twenty-nine documents, `escalations` was zero — including on
+    five documents that were none of the six kinds the classifier knows. Nothing surfaced
+    it, so nothing revealed that the API could not answer it: `get_run` read `gate`
+    interrupts only, and a run parked here reported plain `running` with no question
+    anywhere and no way to reply.
+
+    A branch that becomes reachable has to become answerable in the same change, so this
+    drives it end to end: force an escalation, find the question through a *fresh* read of
+    the run, answer it, and confirm the run continues.
+    """
+
+    @pytest.fixture
+    def unsure(self, monkeypatch):
+        """Force the escalation by making the classifier honest about a poor fit."""
+        from domain.classify import Classification
+
+        def _nearest_only(text, filename, client):
+            return Classification(
+                kind="amendment",
+                vendor="Northwind Analytics LLC",
+                confidence=0.95,  # high on purpose: fit must override confidence
+                reasoning="reads like a data-protection addendum, not an amendment",
+                document_date="2026-01-01",
+                fits_kind=False,
+            )
+
+        monkeypatch.setattr("services.graph.classify_document", _nearest_only)
+
+    def test_the_question_is_reachable_from_a_fresh_read(self, tmp_path, unsure) -> None:
+        (tmp_path / "dpa.md").write_text(MSA, encoding="utf-8")
+
+        started = service.start_run(
+            corpus_name=_unique("escalate"),
+            document_paths=[str(tmp_path / "dpa.md")],
+        )
+
+        assert started["awaiting_classification"] is True
+        assert started["awaiting_review"] is False
+
+        # The part that was broken: a second reader asking "what is pending on this run?"
+        # — which is every request the review page makes on load.
+        fresh = service.get_run(started["run_id"])
+
+        assert fresh["status"] == "awaiting_classification"
+        assert fresh["awaiting_classification"] is True
+        assert len(fresh["escalations"]) == 1
+        assert fresh["escalations"][0]["document"] == "dpa.md"
+        assert "nearest available kind" in fresh["escalations"][0]["reason"]
+
+    def test_none_of_these_is_offered_as_an_answer(self, tmp_path, unsure) -> None:
+        (tmp_path / "dpa.md").write_text(MSA, encoding="utf-8")
+
+        started = service.start_run(
+            corpus_name=_unique("escalate"),
+            document_paths=[str(tmp_path / "dpa.md")],
+        )
+
+        assert "unknown" in started["classification_options"]
+
+    def test_the_gate_says_which_answers_disarm_the_document(self, tmp_path, unsure) -> None:
+        """Floor 4 is machine-drivable end to end, and "which of these answers stops the
+        document governing?" was answerable only by reading the source. A client driving
+        this gate could pick `renewal_notice` for a rate revision — as a human reviewer
+        did — and silently make the document observation-only.
+
+        Checked on a fresh read as well as the start response, because the fresh read is
+        the request every client actually makes on load, and it is the path that was
+        missing the escalation gate entirely the last time this broke.
+        """
+        (tmp_path / "dpa.md").write_text(MSA, encoding="utf-8")
+
+        started = service.start_run(
+            corpus_name=_unique("escalate"),
+            document_paths=[str(tmp_path / "dpa.md")],
+        )
+
+        for payload in (started, service.get_run(started["run_id"])):
+            effects = {o["kind"]: o for o in payload["classification_option_effects"]}
+
+            assert set(effects) == set(payload["classification_options"])
+            assert effects["renewal_notice"]["governs"] is False
+            assert effects["unknown"]["governs"] is False
+            assert effects["msa"]["governs"] is True
+            assert "govern" in effects["renewal_notice"]["effect"].lower()
+
+    def test_an_unanswered_escalation_does_not_keep_the_guess(self, tmp_path, unsure) -> None:
+        """The gate used to fail open. The proposed kind was written to the document
+        before escalating, and classification is skipped for any document that already has
+        a kind — so a run abandoned here left the guess in place and no later run ever
+        asked again."""
+        (tmp_path / "dpa.md").write_text(MSA, encoding="utf-8")
+
+        started = service.start_run(
+            corpus_name=_unique("escalate"),
+            document_paths=[str(tmp_path / "dpa.md")],
+        )
+
+        with session_scope() as session:
+            document = (
+                session.query(Document)
+                .filter(Document.uri.like("%dpa.md"))
+                .order_by(Document.id)
+                .all()
+            )
+            assert document, "precondition: the document was ingested"
+            escalated = [d for d in document if d.kind is None]
+            assert escalated, (
+                "an escalated document must hold no kind — otherwise the question is "
+                "never asked again and the guess silently stands"
+            )
+            # The reviewer still needs the context to answer with.
+            assert escalated[-1].vendor
+
+        assert started["awaiting_classification"] is True
+
+    def test_answering_it_continues_the_run(self, tmp_path, unsure) -> None:
+        (tmp_path / "dpa.md").write_text(MSA, encoding="utf-8")
+
+        started = service.start_run(
+            corpus_name=_unique("escalate"),
+            document_paths=[str(tmp_path / "dpa.md")],
+        )
+        document_id = started["escalations"][0]["document_id"]
+
+        answered = service.resume_run(
+            run_id=started["run_id"], decisions={document_id: "unknown"}
+        )
+
+        assert answered["awaiting_classification"] is False
+        with session_scope() as session:
+            document = session.get(Document, uuid.UUID(document_id))
+            assert document.kind == "unknown", "the human's answer is definitive"
+            assert document.kind_confidence == 1.0
+
+    def test_a_nonsense_answer_leaves_the_document_escalated(self, tmp_path, unsure) -> None:
+        """Stored, it would reach `KIND_PRECEDENCE.get(kind, -1)` and take the default —
+        a typo becoming a silent decision about what governs."""
+        (tmp_path / "dpa.md").write_text(MSA, encoding="utf-8")
+
+        started = service.start_run(
+            corpus_name=_unique("escalate"),
+            document_paths=[str(tmp_path / "dpa.md")],
+        )
+        document_id = started["escalations"][0]["document_id"]
+
+        service.resume_run(
+            run_id=started["run_id"], decisions={document_id: "Purchase Order"}
+        )
+
+        with session_scope() as session:
+            assert session.get(Document, uuid.UUID(document_id)).kind is None
+
+    def test_a_document_that_never_names_us_escalates(self, tmp_path, monkeypatch) -> None:
+        """The check the suite otherwise pins off, exercised here on purpose.
+
+        A subcontractor's agreement between two other companies read correctly, classified
+        correctly, and silently added a vendor to the register that is not a counterparty.
+        """
+        from database.config import get_settings
+
+        monkeypatch.setenv("ORGANISATION_NAME", "Meridian Retail Group")
+        get_settings.cache_clear()
+
+        theirs = tmp_path / "kestrel.md"
+        theirs.write_text(
+            "Master Services Agreement between Kestrel Refrigeration Services Inc "
+            "and Brand Cold Storage Ltd.\n\nThe hourly rate is $88 per hour.\n",
+            encoding="utf-8",
+        )
+
+        try:
+            started = service.start_run(
+                corpus_name=_unique("notours"), document_paths=[str(theirs)]
+            )
+
+            assert started["awaiting_classification"] is True
+            reason = started["escalations"][0]["reason"]
+            assert "never names" in reason
+        finally:
+            get_settings.cache_clear()
+
+    def test_our_own_document_does_not_escalate_for_that_reason(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The check must not flag the corpus it is meant to protect."""
+        from database.config import get_settings
+
+        monkeypatch.setenv("ORGANISATION_NAME", "Meridian Retail Group")
+        get_settings.cache_clear()
+
+        ours = tmp_path / "msa.md"
+        ours.write_text(
+            "Master Services Agreement between Meridian Retail Group and Northwind "
+            "Analytics LLC.\n\n" + MSA,
+            encoding="utf-8",
+        )
+
+        try:
+            started = service.start_run(
+                corpus_name=_unique("ours"), document_paths=[str(ours)]
+            )
+            assert started["awaiting_classification"] is False
+        finally:
+            get_settings.cache_clear()

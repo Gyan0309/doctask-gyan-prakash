@@ -188,3 +188,190 @@ class TestFullRuns:
         """An empty ledger for a nonexistent run would read as 'nothing changed'."""
         with session_scope() as session, pytest.raises(KeyError):
             build_ledger(session, uuid.uuid4())
+
+
+class TestReuseIsInvalidatedByLogicToo:
+    """The counterweight to incrementality, and it was missing.
+
+    Invalidation keyed on fact identity alone: same facts, reuse the bytes. But a section's
+    content is *derived* from its facts, so changing the derivation changes the answer while
+    the fact set stays identical.
+
+    Found live rather than in review. Teaching the reconciler that a renewal notice restates
+    terms rather than governing them was correct, tested and deployed — and the register went
+    on reporting `net forty-five (45) days` sourced from the renewal notice, because every
+    section it applied to carried forward untouched. Structurally the same trap as a prompt
+    fix that looks inert because facts are reused, one layer up.
+    """
+
+    def test_a_derivation_change_re_derives_everything(self, tmp_path, monkeypatch) -> None:
+        (tmp_path / "msa.md").write_text(MSA, encoding="utf-8")
+        corpus = _unique("composer")
+        paths = [str(tmp_path / "msa.md")]
+
+        first = _complete(service.start_run(corpus_name=corpus, document_paths=paths))
+        assert first["status"] == "completed"
+
+        # A second run over an unchanged corpus: everything carries forward.
+        unchanged = _complete(service.start_run(corpus_name=corpus, document_paths=paths))
+        assert unchanged["plan"]["sections_carried_forward"] > 0
+        assert unchanged["plan"]["sections_rederived"] == 0
+
+        # Now the derivation logic changes. Nothing about the documents or the facts moves.
+        monkeypatch.setattr("domain.compose.COMPOSER_VERSION", "compose-test-next")
+
+        after = _complete(service.start_run(corpus_name=corpus, document_paths=paths))
+
+        assert after["plan"]["sections_carried_forward"] == 0, (
+            "a derivation change must invalidate reuse — otherwise a fix to how the "
+            "register is derived silently changes nothing"
+        )
+        assert after["plan"]["sections_rederived"] == after["plan"]["sections_total"]
+
+    def test_carried_forward_content_keeps_the_version_that_made_it(
+        self, tmp_path
+    ) -> None:
+        """Stamping the current version onto copied bytes would claim the current logic
+        produced them, and the next derivation change would find nothing to invalidate."""
+        from models import SectionVersion
+
+        (tmp_path / "msa.md").write_text(MSA, encoding="utf-8")
+        corpus = _unique("composer")
+        paths = [str(tmp_path / "msa.md")]
+
+        _complete(service.start_run(corpus_name=corpus, document_paths=paths))
+        second = _complete(service.start_run(corpus_name=corpus, document_paths=paths))
+
+        with session_scope() as session:
+            carried = (
+                session.query(SectionVersion)
+                .filter(
+                    SectionVersion.run_id == uuid.UUID(second["run_id"]),
+                    SectionVersion.carried_forward.is_(True),
+                )
+                .all()
+            )
+            assert carried, "precondition: something was carried forward"
+            for version in carried:
+                assert version.composer_version is not None
+
+    def test_a_section_written_before_this_existed_is_re_derived(self, tmp_path) -> None:
+        """Rows predating the column hold NULL, which compares unequal to any version, so
+        they are re-derived exactly once. Backfilling a value would have asserted that old
+        content came from current logic — the thing this column exists to deny.
+
+        Simulated by clearing the column, which is precisely the state the migration
+        leaves an existing deployment in.
+        """
+        from sqlalchemy import update
+
+        from models import SectionVersion
+
+        (tmp_path / "msa.md").write_text(MSA, encoding="utf-8")
+        corpus = _unique("composer")
+        paths = [str(tmp_path / "msa.md")]
+
+        first = _complete(service.start_run(corpus_name=corpus, document_paths=paths))
+
+        with session_scope() as session:
+            session.execute(
+                update(SectionVersion)
+                .where(SectionVersion.run_id == uuid.UUID(first["run_id"]))
+                .values(composer_version=None)
+            )
+
+        after = _complete(service.start_run(corpus_name=corpus, document_paths=paths))
+
+        assert after["plan"]["sections_carried_forward"] == 0
+        assert after["plan"]["sections_rederived"] == after["plan"]["sections_total"]
+
+
+class TestAnUnrelatedDocumentTouchesNothing:
+    """A new vendor's agreement must not re-derive another vendor's rows.
+
+    Measured on the live corpus and it did: adding one agreement for a brand-new vendor
+    re-derived 69 sections, of which **62 produced byte-identical content**. Model cost was
+    zero — the facts were reused — so the claim "an update costs like an update" survives on
+    calls. But 62 sections of pointless work is 62 chances for the carry-forward guarantee
+    to be quietly wrong, and "it re-derived and happened to match" is exactly the
+    regenerate-then-compare behaviour this module exists to avoid.
+    """
+
+    OTHER_VENDOR = """Halstead Weighing Systems Services Agreement
+
+Engineer attendance is charged at ninety-five dollars ($95) per hour.
+
+Payment terms are net thirty (30) days from the date of invoice.
+
+Governing law is the State of Illinois.
+"""
+
+    def test_a_new_vendor_does_not_disturb_an_existing_one(self, tmp_path) -> None:
+        (tmp_path / "msa.md").write_text(MSA, encoding="utf-8")
+        corpus = _unique("unrelated")
+
+        first = _complete(
+            service.start_run(corpus_name=corpus, document_paths=[str(tmp_path / "msa.md")])
+        )
+        assert first["status"] == "completed"
+        before = len(service.get_deliverable(first["run_id"])["sections"])
+
+        (tmp_path / "other.md").write_text(self.OTHER_VENDOR, encoding="utf-8")
+        second = _complete(
+            service.start_run(
+                corpus_name=corpus,
+                document_paths=[str(tmp_path / "msa.md"), str(tmp_path / "other.md")],
+            )
+        )
+
+        plan = second["plan"]
+        added = plan["sections_total"] - before
+
+        assert plan["sections_rederived"] == added, (
+            f"only the {added} new sections should be re-derived, "
+            f"but {plan['sections_rederived']} were"
+        )
+        assert plan["sections_carried_forward"] == before
+
+    def test_nothing_re_derived_reproduces_bytes_it_already_had(self, tmp_path) -> None:
+        """The stronger form. A section that re-derives to the same hash was re-derived
+        for no reason, and that is the signal worth catching — it is invisible in the
+        output and only shows up in the plan."""
+        from models import SectionVersion
+
+        (tmp_path / "msa.md").write_text(MSA, encoding="utf-8")
+        corpus = _unique("unrelated")
+
+        first = _complete(
+            service.start_run(corpus_name=corpus, document_paths=[str(tmp_path / "msa.md")])
+        )
+        (tmp_path / "other.md").write_text(self.OTHER_VENDOR, encoding="utf-8")
+        second = _complete(
+            service.start_run(
+                corpus_name=corpus,
+                document_paths=[str(tmp_path / "msa.md"), str(tmp_path / "other.md")],
+            )
+        )
+
+        with session_scope() as session:
+            before = {
+                sv.section_key: sv.content_hash
+                for sv in session.query(SectionVersion)
+                .filter(SectionVersion.run_id == uuid.UUID(first["run_id"]))
+                .all()
+            }
+            pointless = [
+                sv.section_key
+                for sv in session.query(SectionVersion)
+                .filter(
+                    SectionVersion.run_id == uuid.UUID(second["run_id"]),
+                    SectionVersion.carried_forward.is_(False),
+                )
+                .all()
+                if before.get(sv.section_key) == sv.content_hash
+            ]
+
+        assert pointless == [], (
+            f"{len(pointless)} sections were re-derived and produced the bytes they "
+            f"already had: {pointless[:5]}"
+        )

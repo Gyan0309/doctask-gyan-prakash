@@ -129,24 +129,85 @@ class TestWhatTheRunReceives:
 
 
 class TestPriming:
-    def test_priming_records_existing_files_without_running(self, tmp_path) -> None:
-        """A restart must not re-process the whole directory as though it just
-        arrived — on a per-day quota that spends the budget on completed work."""
+    """Priming asks "what has been ingested", which only the corpus can answer.
+
+    It used to ask the filesystem, which gets the restart case right and the
+    fresh-deployment case wrong in the worst direction: an inbox full of documents that
+    were never processed is marked as already seen, and nothing ever processes them.
+    """
+
+    def test_documents_already_ingested_do_not_re_run(self, tmp_path) -> None:
+        """A restart must not re-process the whole directory as though it just arrived —
+        on a per-day quota that spends the budget on completed work, and reporting
+        thirty-six new documents when none arrived is false besides."""
         runner = _Recorder()
         _write(tmp_path, "msa.md", "The hourly rate is $195 per hour.")
         _write(tmp_path, "sow.md", "The hourly rate is $210 per hour.")
+        ingested = list_documents(tmp_path)
+
+        watcher = Watcher(
+            tmp_path, corpus_name="c", start_run=runner, known=lambda _c: ingested
+        )
+        watcher.prime()
+
+        assert runner.calls == []
+        result = watcher.poll()
+        assert result.triggered is False
+        assert result.added == [], "nothing arrived, so nothing may be reported as added"
+
+    def test_an_inbox_that_was_never_ingested_is_processed(self, tmp_path) -> None:
+        """The case filesystem priming got wrong. A fresh deployment whose inbox already
+        holds documents must process them, not mark them seen and go quiet."""
+        runner = _Recorder()
+        _write(tmp_path, "msa.md", "The hourly rate is $195 per hour.")
+
+        watcher = Watcher(
+            tmp_path, corpus_name="c", start_run=runner, known=lambda _c: {}
+        )
+        watcher.prime()
+
+        assert watcher.poll().triggered is True
+        assert len(runner.calls) == 1
+
+    def test_an_edited_document_is_seen_as_modified(self, tmp_path) -> None:
+        """Priming carries hashes, not just names, so a file changed while the service
+        was down is picked up rather than mistaken for one already handled."""
+        runner = _Recorder()
+        _write(tmp_path, "msa.md", "The hourly rate is $195 per hour.")
+        ingested = list_documents(tmp_path)
+
+        watcher = Watcher(
+            tmp_path, corpus_name="c", start_run=runner, known=lambda _c: ingested
+        )
+        watcher.prime()
+        _write(tmp_path, "msa.md", "The hourly rate is $265 per hour.")
+
+        result = watcher.poll()
+
+        assert result.triggered is True
+        assert result.modified == ["msa.md"]
+
+    def test_with_no_source_of_truth_it_fails_towards_doing_the_work(
+        self, tmp_path
+    ) -> None:
+        """Priming empty re-processes; priming full silently skips. Only one of those is
+        recoverable by looking at the output."""
+        runner = _Recorder()
+        _write(tmp_path, "msa.md", "The hourly rate is $195 per hour.")
 
         watcher = Watcher(tmp_path, corpus_name="c", start_run=runner)
         watcher.prime()
 
-        assert runner.calls == []
-        assert watcher.poll().triggered is False
+        assert watcher.poll().triggered is True
 
     def test_a_document_arriving_after_priming_still_triggers(self, tmp_path) -> None:
         runner = _Recorder()
         _write(tmp_path, "msa.md", "The hourly rate is $195 per hour.")
+        ingested = list_documents(tmp_path)
 
-        watcher = Watcher(tmp_path, corpus_name="c", start_run=runner)
+        watcher = Watcher(
+            tmp_path, corpus_name="c", start_run=runner, known=lambda _c: ingested
+        )
         watcher.prime()
         _write(tmp_path, "amendment.md", "The hourly rate is $210 per hour.")
 

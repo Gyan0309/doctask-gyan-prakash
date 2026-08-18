@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
@@ -33,7 +34,13 @@ from sqlalchemy import select
 
 from database.config import get_settings
 from database.db import session_scope
-from domain.render import _row, render_register, render_section, section_ref
+from domain.render import (
+    _row,
+    humanise_term,
+    render_register,
+    render_section,
+    section_ref,
+)
 from integrations.superdocs import SuperDocsClient, SuperDocsError, SuperDocsUnavailable
 from models import Corpus, Run
 from services import service
@@ -126,14 +133,13 @@ def publish(run_id: str, *, changed_only: bool = True) -> dict[str, Any]:
     individually — which is the same per-item review this system holds internally,
     performed against SuperDocs' own gate.
 
-    `changed_only=False` forces a full re-upload. Useful when the document in SuperDocs
-    has been edited by hand and you want ours to win.
+    "Changed" means **the published document does not already hold this section's
+    current content**, compared by revision marker — not "this run re-derived it".
+    Those two readings differ in exactly the cases that matter: republishing costs only
+    what still differs, and a section the register has *dropped* is visible at all.
 
-    "Changed" means **this run re-derived it** rather than carrying it forward — not
-    "changed since the last publish". Publishing the same run twice therefore sends the
-    same edits again: the outcome is identical, because the content is, but it is not
-    free. The distinction is worth stating because the two readings differ only when
-    you republish, which is exactly when you would be surprised.
+    `changed_only=False` forces a full re-upload, for when the document has been edited
+    by hand and you want ours to win outright.
     """
     # Corpus lookup first, because it is the only call that distinguishes "no such run"
     # from "a run with an empty register". `get_deliverable` returns `{"sections": []}`
@@ -168,8 +174,6 @@ def publish(run_id: str, *, changed_only: bool = True) -> dict[str, Any]:
         return _degraded(str(exc))
 
     with run_context(run_id):
-        changed = _changed_sections(run_id, sections) if changed_only else sections
-
         try:
             existing = _existing_document(client, session_id)
         except SuperDocsUnavailable as exc:
@@ -183,10 +187,27 @@ def publish(run_id: str, *, changed_only: bool = True) -> dict[str, Any]:
             except SuperDocsUnavailable as exc:
                 return _degraded(f"SuperDocs became unreachable mid-upload: {exc}")
 
-        if not changed:
+        # Read the published state before deciding what to do to it. Exports are free,
+        # and this is the only thing that knows which sections the document is still
+        # carrying that the register has since dropped.
+        try:
+            document = client.export(session_id, fmt="markdown").decode("utf-8", "replace")
+        except SuperDocsUnavailable as exc:
+            return _degraded(f"SuperDocs is unreachable: {exc}")
+        except SuperDocsError as exc:
+            # Cannot read the current state, so cannot compute a diff. Falling back to
+            # run provenance here would silently reintroduce both bugs this reconcile
+            # exists to fix, so it refuses instead.
+            raise SuperDocsError(
+                f"could not read the published document to reconcile against: {exc}"
+            ) from None
+
+        plan = reconcile_against(sections, parse_document(document))
+
+        if plan.is_noop:
             # The strongest possible outcome, and it must not be mistaken for a
-            # failure: nothing moved, so nothing was sent, so nothing was spent.
-            log(logger, logging.INFO, "publish: nothing changed; no operations spent")
+            # failure: the document already says exactly this, so nothing was sent.
+            log(logger, logging.INFO, "publish: document already matches; nothing spent")
             return {
                 "run_id": run_id,
                 "corpus": corpus,
@@ -195,14 +216,18 @@ def publish(run_id: str, *, changed_only: bool = True) -> dict[str, Any]:
                 "mode": "no-op",
                 "sections_total": len(sections),
                 "sections_edited": 0,
+                "sections_removed": 0,
+                "sections_untouched": plan.unchanged,
                 "changes_proposed": 0,
                 "changes_approved": 0,
+                "verified": True,
+                "mismatches": [],
                 "api_calls": client.calls_made,
-                "reason": "this run carried every section forward, so there is nothing to edit",
+                "reason": "the published document already matches the register",
             }
 
-        return _edit_changed(
-            client, run_id, corpus, session_id, existing.document_id, changed, len(sections)
+        return _apply(
+            client, run_id, corpus, session_id, existing.document_id, plan, len(sections)
         )
 
 
@@ -217,14 +242,74 @@ def _existing_document(client: SuperDocsClient, session_id: str):
     return documents[-1] if documents else None
 
 
-def _changed_sections(run_id: str, sections: list[dict]) -> list[dict]:
-    """Sections this run re-derived rather than carried forward.
+def parse_document(document: str) -> dict[str, str]:
+    """Every section the published document currently holds: `ref → revision`.
 
-    Read straight off `carried_forward`, which is the same flag the change ledger and
-    the incrementality claim use. Nothing is recomputed here — if this disagreed with
-    the register, one of them would be wrong.
+    This is the published state, read back rather than assumed. `rev` is empty for a
+    section written before revision markers existed, which reads as "unknown" and
+    therefore as needing a rewrite — the safe direction.
     """
-    return [s for s in sections if not s.get("carried_forward")]
+    # Escaping survives the markdown round trip; normalise before matching.
+    flat = document.replace("\\", "")
+    found: dict[str, str] = {}
+
+    current: str | None = None
+    for line in flat.splitlines():
+        if line.lstrip().startswith("#"):
+            match = re.search(r"\[ref:([0-9a-f]{8})\]", line)
+            current = match.group(1) if match else None
+            if current:
+                found.setdefault(current, "")
+        elif current:
+            rev = re.search(r"·\s*rev\s+([0-9a-f]{4,})", line)
+            if rev:
+                found[current] = rev.group(1)
+
+    return found
+
+
+@dataclass
+class Reconciliation:
+    """The difference between what the register says and what the document holds."""
+
+    to_write: list[dict]
+    to_remove: list[str]
+    unchanged: int
+
+    @property
+    def is_noop(self) -> bool:
+        return not self.to_write and not self.to_remove
+
+
+def reconcile_against(sections: list[dict], published: dict[str, str]) -> Reconciliation:
+    """Diff the register against the published document.
+
+    **This replaces deriving the change set from `carried_forward`,** and the difference
+    is not an optimisation — it fixes two things that flag could not express.
+
+    A section *removed* from the register appears in neither `sections` nor the
+    carried-forward set, so nothing ever mentioned it and the document went on asserting
+    a withdrawn obligation forever. Only the published state knows it is there.
+
+    And `carried_forward` describes what *this run* did, not what the document already
+    has. Retrying a partial publish re-sent every re-derived section and re-paid for the
+    ones that had already landed — which contradicts the claim the whole module is built
+    around. Comparing revisions makes a retry cost only what actually still differs.
+    """
+    desired = {section_ref(s.get("section_key", "")): s for s in sections}
+
+    to_write = [
+        section
+        for ref, section in desired.items()
+        if published.get(ref, "") != str(section.get("content_hash") or "")[:8]
+    ]
+    to_remove = [ref for ref in published if ref not in desired]
+
+    return Reconciliation(
+        to_write=to_write,
+        to_remove=to_remove,
+        unchanged=len(desired) - len(to_write),
+    )
 
 
 def _upload_whole(
@@ -267,51 +352,95 @@ def _upload_whole(
     }
 
 
-def _edit_changed(
+def _removal_instruction(ref: str) -> str:
+    """Delete the section carrying `ref`, and nothing else.
+
+    Removal has to be as targeted as a rewrite: this fires when an obligation has been
+    withdrawn from the register, and a delete that takes a neighbouring section with it
+    would be a far worse failure than the stale section it was cleaning up.
+    """
+    return (
+        f"In this register, find the single section whose heading contains the marker "
+        f"[ref:{ref}] and delete that section entirely — its heading line and its "
+        f"body.\n\n"
+        f"Remove nothing else. Sections are identified only by their [ref:...] marker; "
+        f"do not match on vendor or term, because two sections may share both. If no "
+        f"section carries [ref:{ref}], make no change at all."
+    )
+
+
+def _apply(
     client: SuperDocsClient,
     run_id: str,
     corpus: str,
     session_id: str,
     document_id: str,
-    changed: list[dict],
+    plan: Reconciliation,
     total: int,
 ) -> dict[str, Any]:
-    """One instruction per changed section, each change approved individually."""
+    """Bring the document to the register's state: rewrite what differs, delete what
+    the register no longer has, touch nothing else."""
     log(
         logger,
         logging.INFO,
-        "publish: editing only what moved",
-        changed=len(changed),
-        total=total,
+        "publish: reconciling document against register",
+        rewrite=len(plan.to_write),
+        remove=len(plan.to_remove),
+        unchanged=plan.unchanged,
     )
 
     proposed = 0
     approved = 0
     edited: list[str] = []
     edited_sections: list[dict] = []
+    removed: list[str] = []
     failures: list[dict[str, str]] = []
 
-    for section in changed:
+    def _drive(instruction: str) -> int:
+        """Propose, then decide every returned change individually."""
+        nonlocal proposed, approved
+        # Approve returns 200 before the change is applied, so the session is still
+        # busy when the next instruction arrives. Waiting is what the 409 tells you
+        # to do, and driving a register in a loop hits it every time.
+        client.wait_until_idle(session_id)
+        result = client.propose(
+            session_id=session_id, message=instruction, document_id=document_id
+        )
+        proposed += len(result.pending_changes)
+        for change in result.pending_changes:
+            client.decide(
+                session_id, job_id=result.job_id, change_id=change.change_id, approved=True
+            )
+            approved += 1
+        return len(result.pending_changes)
+
+    # Removals first. A section the register has dropped should not sit in the document
+    # while the rewrites go in — and doing them first means a failure part-way leaves
+    # the document with fewer stale sections rather than more.
+    for ref in plan.to_remove:
+        try:
+            _drive(_removal_instruction(ref))
+            removed.append(ref)
+        except SuperDocsUnavailable as exc:
+            failures.append({"section_key": f"[ref:{ref}]", "error": f"unreachable: {exc}"[:200]})
+            break
+        except SuperDocsError as exc:
+            log(
+                logger,
+                logging.ERROR,
+                "publish: removal failed, continuing",
+                ref=ref,
+                error=type(exc).__name__,
+            )
+            failures.append({"section_key": f"[ref:{ref}]", "error": str(exc)[:200]})
+
+    for section in plan.to_write:
         key = section.get("section_key", "")
         ref = section_ref(key)
         instruction = _instruction_for(section, ref)
 
         try:
-            # Approve returns 200 before the change is applied, so the session is still
-            # busy when the next instruction arrives. Waiting is what the 409 tells you
-            # to do, and driving a register in a loop hits it every time.
-            client.wait_until_idle(session_id)
-            result = client.propose(
-                session_id=session_id, message=instruction, document_id=document_id
-            )
-            proposed += len(result.pending_changes)
-
-            for change in result.pending_changes:
-                client.decide(
-                    session_id, job_id=result.job_id, change_id=change.change_id, approved=True
-                )
-                approved += 1
-
+            _drive(instruction)
             edited.append(key)
             edited_sections.append(section)
         except SuperDocsUnavailable as exc:
@@ -324,7 +453,7 @@ def _edit_changed(
                 logging.ERROR,
                 "publish: SuperDocs became unreachable; stopping",
                 edited_so_far=len(edited),
-                remaining=len(changed) - len(edited) - len(failures),
+                remaining=len(plan.to_write) - len(edited) - len(failures),
             )
             failures.append({"section_key": key, "error": f"unreachable: {exc}"[:200]})
             break
@@ -362,7 +491,8 @@ def _edit_changed(
         "mode": "incremental-edit",
         "sections_total": total,
         "sections_edited": len(edited),
-        "sections_untouched": total - len(changed),
+        "sections_removed": len(removed),
+        "sections_untouched": plan.unchanged,
         "changes_proposed": proposed,
         "changes_approved": approved,
         "verified": verified,
@@ -370,8 +500,8 @@ def _edit_changed(
         "failures": failures,
         "api_calls": client.calls_made,
         "reason": (
-            f"{len(edited)} of {total} sections edited; "
-            f"{total - len(changed)} untouched because nothing they depend on changed"
+            f"{len(edited)} of {total} sections rewritten, {len(removed)} removed; "
+            f"{plan.unchanged} left alone because the document already matches"
         ),
     }
 
@@ -417,7 +547,7 @@ def _instruction_for(section: dict, ref: str) -> str:
     rendered = render_section(section)
     row = _row(section)
     vendor = _neutralise(str(row.get("vendor") or "Unknown vendor"))
-    term = _neutralise(str(row.get("term") or section.get("section_key", "")))
+    term = _neutralise(humanise_term(str(row.get("term") or section.get("section_key", ""))))
 
     heading = f"### {vendor} — {term} [ref:{ref}]"
     body = _neutralise("\n".join(rendered.splitlines()[1:]))

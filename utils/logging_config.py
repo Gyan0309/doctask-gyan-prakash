@@ -53,6 +53,38 @@ class ContextFilter(logging.Filter):
         return True
 
 
+# Every successful poll of one of these is one access line, five endpoints every three
+# seconds. With a browser tab open, `docker compose logs` is almost entirely `GET
+# /runs/{id}`, `/deliverable`, `/cost`, `/changes` — the run's own log buried under the
+# page watching it. Reading what a run actually did meant filtering them out by hand.
+_POLL_NOISE = ("/deliverable", "/cost", "/changes", "/provenance", "/runs", "/health")
+
+
+class PollingFilter(logging.Filter):
+    """Drop access-log lines for successful polls of read-only endpoints.
+
+    Deliberately narrow, because silently discarding logs is how you lose the ability to
+    debug the thing doing the polling:
+
+      * only the access logger, never application logs;
+      * only 2xx and 304 — any error, redirect or rejection is kept, so a poll that
+        starts failing is as visible as it ever was;
+      * only GETs of the listed read-only paths, so nothing that changes state is ever
+        hidden;
+      * switchable with `LOG_ACCESS=all` when the polling itself is what you are
+        investigating.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if not message.startswith("GET "):
+            return True
+        if not any(fragment in message for fragment in _POLL_NOISE):
+            return True
+        # uvicorn's access line ends with the status: `... HTTP/1.1" 200 OK`.
+        return not any(f'" {code}' in message for code in (200, 204, 304))
+
+
 class HumanFormatter(logging.Formatter):
     """Aligned, scannable output.
 
@@ -122,6 +154,12 @@ def configure_logging(level: str | None = None, fmt: str | None = None) -> None:
 
     for name, lvl in NOISY.items():
         logging.getLogger(name).setLevel(lvl)
+
+    # Applied to the access logger rather than the handler, so it cannot suppress
+    # anything an application logger emits — including the request-scoped lines the API
+    # writes itself.
+    if (os.environ.get("LOG_ACCESS") or "quiet").lower() != "all":
+        logging.getLogger("uvicorn.access").addFilter(PollingFilter())
 
     _CONFIGURED = True
 

@@ -85,10 +85,38 @@ class TestDurations:
             # flooded the review queue — found in a live run, not in review.
             ("45", 45),
             ("15", 15),
+            # A written number with its numeral and no unit word. This shape arrived
+            # with a new extraction prompt and broke silently: Talus's payment-terms
+            # finding vanished between two live runs, not because the terms changed but
+            # because the value stopped being comparable.
+            ("forty-five (45)", 45),
+            ("thirty (30)", 30),
+            ("ninety (90)", 90),
+            ("net forty-five (45) days", 45),
         ],
     )
     def test_day_forms(self, raw, expected) -> None:
         assert normalize_days(raw) == Decimal(expected)
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            # The liability-cap formula. An unanchored search for a parenthesised
+            # numeral would return 3 from here, and a cap of 3 then gets compared
+            # against real money — the fault this module's docstring warns about.
+            "the lesser of three (3) times the fees and five million dollars ($5,000,000)",
+            "three (3) times the fees charged on that matter",
+            # OCR damage. A numeral we cannot read must stay refused rather than be
+            # rescued into a plausible-looking wrong number.
+            "si xty (6O)",
+            "tvve1ve (l2)",
+        ],
+    )
+    def test_a_numeral_inside_a_longer_phrase_is_still_refused(self, raw) -> None:
+        """Accepting `word (N)` must not become accepting `(N)` anywhere. The whole
+        value has to be the word-and-numeral pair, or it is not that shape."""
+        assert normalize_days(raw) is None
+        assert normalize_months(raw) is None
 
     @pytest.mark.parametrize(
         "raw,expected",
@@ -98,6 +126,8 @@ class TestDurations:
             ("36 months", 36),
             ("2 years", 24),  # converted, because the rule is written in months
             ("24", 24),  # bare number, unit implied by the predicate
+            ("twelve (12)", 12),  # numeral without its unit word
+            ("sixty (60)", 60),
         ],
     )
     def test_month_forms_including_written_numerals(self, raw, expected) -> None:
@@ -113,6 +143,39 @@ class TestDurations:
         assert days is not None and months is not None
         assert days.number == months.number
         assert days.unit != months.unit
+
+
+class TestTheSixValuesRunCb4ed630CouldNotRead:
+    """The exact strings a live run reported as unnormalizable, kept verbatim.
+
+    Their consequence is the reason this class exists rather than a line in the
+    parametrize list above: three playbook checks stopped running for Talus and the
+    only trace was three `low` severity notes. A finding that disappears looks
+    identical to a finding that was never true.
+    """
+
+    @pytest.mark.parametrize(
+        "predicate,raw,expected",
+        [
+            ("payment_terms_days", "forty-five (45)", 45),
+            ("auto_renew_months", "twelve (12)", 12),
+            ("termination_notice_days", "ninety (90)", 90),
+            ("payment_terms_days", "thirty (30)", 30),
+            ("termination_notice_days", "thirty (30)", 30),
+        ],
+    )
+    def test_each_one_now_normalizes(self, predicate, raw, expected) -> None:
+        result = normalize(predicate, raw)
+        assert result is not None, f"{predicate}={raw!r} is still uncomparable"
+        assert result.number == Decimal(expected)
+
+    def test_a_zero_quantity_is_a_value_not_an_absence(self) -> None:
+        """Found while fixing the above: the quantity branch chained with `or`, and
+        Decimal("0") is falsy — so a zero-hour line normalized to None and dropped out
+        of the arithmetic comparator without saying anything."""
+        result = normalize("invoice_hours", "0")
+        assert result is not None
+        assert result.number == Decimal(0)
 
 
 class TestDates:
@@ -188,9 +251,11 @@ class TestReconciliation:
         resolutions = reconcile([standard, specialist])
 
         assert len(resolutions) == 2, "scoped and unscoped terms resolve separately"
+        # Scope is folded, so one column labelled differently by two documents is one
+        # scope. The identifier is the folded form.
         values = {r.scope: r.governing.value_raw for r in resolutions}
         assert values[None] == "$195"
-        assert values["ALPHA"] == "$210"
+        assert values["alpha"] == "$210"
 
     def test_a_term_with_only_an_invoice_is_unsupported_not_asserted(self) -> None:
         """No agreement sets this term, only a bill records it. The register says
@@ -215,6 +280,93 @@ class TestReconciliation:
         amendment = _fact("payment_terms_days", "net 30", "amendment", same_day)
 
         assert reconcile([msa, amendment])[0].governing is amendment
+
+
+class TestARestatementDoesNotOverruleTheInstrument:
+    """The renewal-notice trap, and the clearest case of a defence that did not work.
+
+    `KIND_PRECEDENCE` already ranked `renewal_notice` *below* the MSA, with a comment
+    saying a restatement must not become the governing source for the agreement's own
+    terms. It became one anyway, because precedence is only a tie-break and `_sort_key`
+    compares the effective date first.
+
+    Measured live: Talus's payment terms resolved to `net forty-five (45) days` from the
+    renewal notice, dated after Amendment No. 1, with the amendment's `net thirty (30)
+    days` filed as superseded. The amendment was read correctly and then overruled by a
+    courtesy letter repeating the old figure, because the letter was newer.
+    """
+
+    def test_a_later_notice_does_not_supersede_an_amendment(self) -> None:
+        amendment = _fact("payment_terms_days", "net 30", "amendment", date(2025, 7, 1))
+        notice = _fact("payment_terms_days", "net 45", "renewal_notice", date(2026, 5, 6))
+
+        resolution = reconcile([amendment, notice])[0]
+
+        assert resolution.governing is amendment
+        assert resolution.governing.value_raw == "net 30"
+
+    def test_the_restated_term_is_kept_as_an_observation(self) -> None:
+        """Not discarded. A notice restating a term the agreement changed is exactly the
+        discrepancy a reviewer should see — the corpus plants one deliberately, restating
+        a 24-month renewal against an agreement that says 12."""
+        agreement = _fact("auto_renew_months", "12 months", "msa", date(2023, 9, 1))
+        notice = _fact("auto_renew_months", "24 months", "renewal_notice", date(2026, 5, 6))
+
+        resolution = reconcile([agreement, notice])[0]
+
+        assert resolution.governing is agreement
+        assert [f.value_raw for f in resolution.observations] == ["24 months"]
+
+    def test_a_term_only_a_notice_states_is_unsupported(self) -> None:
+        notice = _fact("auto_renew_months", "24 months", "renewal_notice", date(2026, 5, 6))
+        resolution = reconcile([notice])[0]
+
+        assert resolution.governing is None
+        assert resolution.status == "unsupported"
+
+
+class TestAnUnidentifiedDocumentGovernsNothing:
+    """A low rank is not a safeguard, because rank is only a tie-break.
+
+    `unknown` was ranked -1, which read as safe and was not: `_sort_key` compares the
+    effective date first, so a 2026 document nobody could identify beat the 2023 MSA it
+    sat beside on date alone. That is how a data-protection addendum came to outrank the
+    agreement it accompanied.
+    """
+
+    def test_a_later_unknown_document_does_not_beat_the_agreement(self) -> None:
+        msa = _fact("liability_cap", "$2,000,000", "msa", date(2023, 6, 1))
+        mystery = _fact("liability_cap", "$50,000", "unknown", date(2026, 4, 1))
+
+        resolution = reconcile([msa, mystery])[0]
+
+        assert resolution.governing is msa
+        assert resolution.status == "agreed"
+
+    def test_its_value_is_still_recorded_as_an_observation(self) -> None:
+        """Not governing is not the same as being discarded. The value is exactly what
+        a reviewer needs to see in order to decide what the document is."""
+        msa = _fact("liability_cap", "$2,000,000", "msa", date(2023, 6, 1))
+        mystery = _fact("liability_cap", "$50,000", "unknown", date(2026, 4, 1))
+
+        resolution = reconcile([msa, mystery])[0]
+
+        assert [f.value_raw for f in resolution.observations] == ["$50,000"]
+
+    def test_a_term_only_an_unknown_document_states_is_unsupported(self) -> None:
+        mystery = _fact("hourly_rate", "$999", "unknown", date(2026, 4, 1))
+        resolution = reconcile([mystery])[0]
+
+        assert resolution.governing is None
+        assert resolution.status == "unsupported"
+
+    def test_the_rank_still_loses_a_date_tie(self) -> None:
+        """Belt and braces: the tie-break must agree with the stronger rule."""
+        same_day = date(2025, 7, 1)
+        msa = _fact("governing_law", "Delaware", "msa", same_day)
+        mystery = _fact("governing_law", "Nevada", "unknown", same_day)
+
+        assert reconcile([msa, mystery])[0].governing is msa
 
 
 class TestHistoricalGoverningValue:

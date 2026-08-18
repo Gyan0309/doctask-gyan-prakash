@@ -21,12 +21,13 @@ import logging
 from dataclasses import dataclass
 
 from domain.conflicts import ConflictCandidate
+from domain.direction import contradicts, sentence
 from services.metering import MeteredClient
 from utils.logging_config import get_logger, log
 
 logger = get_logger(__name__)
 
-PROMPT_VERSION = "adjudicate-v1"
+PROMPT_VERSION = "adjudicate-v2"
 
 SEVERITIES = ["low", "medium", "high"]
 
@@ -57,6 +58,11 @@ class Adjudication:
     is_real_conflict: bool
     severity: str
     explanation: str
+    # True when the model's own wording was discarded for contradicting the computed
+    # direction. Recorded rather than merely logged, so "the adjudicator got this
+    # backwards" is countable across a run instead of being visible only to whoever
+    # happened to read the container output.
+    explanation_withheld: bool = False
 
 
 def build_prompt(candidates: list[ConflictCandidate]) -> str:
@@ -69,7 +75,7 @@ def build_prompt(candidates: list[ConflictCandidate]) -> str:
     """
     lines = []
     for index, candidate in enumerate(candidates):
-        lines.append(
+        block = (
             f"[{index}] kind={candidate.kind} vendor={candidate.subject!r} "
             f"term={candidate.predicate!r}\n"
             f"     finding: {candidate.detail}\n"
@@ -80,6 +86,9 @@ def build_prompt(candidates: list[ConflictCandidate]) -> str:
             f"effective {candidate.b.effective_date or 'undated'}, "
             f"value {candidate.b.value_raw!r}"
         )
+        if direction := sentence(candidate.kind, candidate.comparison):
+            block += f"\n     {direction}"
+        lines.append(block)
 
     return f"""You review discrepancies found in a set of vendor contract documents by
 a deterministic checker. The arithmetic has already been done and is correct — do not
@@ -95,6 +104,17 @@ For each numbered candidate, decide:
   costs money is high. An ambiguity in wording that changes nothing is low.
 - `explanation`: one or two sentences a contract manager would find useful. State what
   the discrepancy is and what should happen about it. Do not restate the arithmetic.
+
+Where a candidate carries a `Direction, computed:` line, that line was measured from the
+normalized values and is authoritative. Your explanation must agree with it:
+
+- If it says the value is LOWER, do not call it higher, and do not recommend a refund,
+  a credit, a clawback or any recovery of money. Nothing is owed to us in that
+  direction — the useful action is confirming whether the reduction was intended.
+- If it says the value is HIGHER, do not describe it as a discount or an underpayment.
+
+An explanation that points the opposite way to that line will be discarded and replaced
+with the computed sentence, so a wrong direction costs your judgement its voice.
 
 Return a verdict for every candidate, using the index given.
 
@@ -155,12 +175,37 @@ def adjudicate(
             continue
 
         severity = verdict.get("severity")
+        explanation = (verdict.get("explanation") or candidate.detail).strip()
+        withheld = False
+
+        if contradicts(explanation, candidate.comparison):
+            # The numbers were right and the sentence was backwards. Substituting the
+            # computed sentence keeps the finding — the discrepancy is real and was
+            # found deterministically — while refusing to pass on a recommendation
+            # derived from the wrong sign.
+            log(
+                logger,
+                logging.WARNING,
+                "adjudicator explanation contradicted the computed direction; withheld",
+                kind=candidate.kind,
+                term=candidate.predicate,
+                subject=candidate.subject,
+                rejected=explanation,
+            )
+            explanation = (
+                f"{sentence(candidate.kind, candidate.comparison)} {candidate.detail} "
+                f"(The adjudicator described this difference in the opposite direction, "
+                f"so its wording was withheld and the computed one shown instead.)"
+            )
+            withheld = True
+
         results.append(
             Adjudication(
                 candidate=candidate,
                 is_real_conflict=bool(verdict.get("is_real_conflict", True)),
                 severity=severity if severity in SEVERITIES else "medium",
-                explanation=(verdict.get("explanation") or candidate.detail).strip(),
+                explanation=explanation,
+                explanation_withheld=withheld,
             )
         )
 
