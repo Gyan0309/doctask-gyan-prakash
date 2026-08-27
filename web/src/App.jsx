@@ -106,8 +106,12 @@ export default function App() {
     [refreshRuns],
   );
 
+  // Only what actually needs a decision. Findings carried forward from an earlier run
+  // are settled, so counting them here put a "9" on the tab above a pane that reads
+  // "0 new findings" — the badge contradicting the page it points at.
   const pendingCount =
-    (run?.pending_findings?.length ?? 0) + (run?.escalations?.length ?? 0);
+    (run?.pending_findings?.filter((f) => !f.prior_verdict).length ?? 0) +
+    (run?.escalations?.length ?? 0);
   const rowCount = deliverable?.sections?.length ?? 0;
 
   // Land on whichever pane has something to do. A completed run opening on an empty

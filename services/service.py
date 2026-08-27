@@ -479,6 +479,7 @@ def get_run(run_id: str) -> dict[str, Any]:
     # that happened to trigger it.
     result["awaiting_review"] = False
     result["pending_findings"] = []
+    result["resolved_findings"] = []
     result["awaiting_classification"] = False
     result["escalations"] = []
     result["classification_options"] = []
@@ -508,9 +509,85 @@ def get_run(run_id: str) -> dict[str, Any]:
                     )
                 elif "gate" in nxt:
                     result["awaiting_review"] = True
-                    result["pending_findings"] = value.get("findings", [])
+                    pending = [dict(f) for f in (value.get("findings") or [])]
+                    priors = _prior_verdicts(
+                        [f.get("explanation", "") for f in pending]
+                    )
+                    for f in pending:
+                        # None means "never ruled on" — the reviewer must decide.
+                        f["prior_verdict"] = priors.get(f.get("explanation", ""))
+                    result["pending_findings"] = pending
+                    result["resolved_findings"] = _resolved_findings(
+                        [f.get("explanation", "") for f in pending], run_id
+                    )
 
     return result
+
+
+def _prior_verdicts(explanations: list[str]) -> dict[str, str]:
+    """Map a finding's explanation to the most recent human verdict on an identical one.
+
+    Identity is the explanation string, which already encodes the rule, the vendor and
+    the values in play. That choice is the safety property: if a liability cap moves,
+    the explanation moves with it, so the finding counts as new and the reviewer is
+    asked again. Only a byte-identical finding inherits a verdict.
+
+    Without this the incremental claim held for the machine and not for the person —
+    one amendment re-derived two sections out of two hundred and fifty, then asked a
+    human to re-decide nine findings they had already ruled on minutes earlier. The
+    section layer carried forward; the decision layer did not.
+    """
+    wanted = [e for e in explanations if e]
+    if not wanted:
+        return {}
+
+    with session_scope() as session:
+        rows = session.execute(
+            select(Finding.explanation, Decision.verdict)
+            .join(Decision, Decision.target_id == Finding.id)
+            .where(Decision.kind == "finding")
+            .where(Finding.explanation.in_(wanted))
+            .order_by(Decision.created_at.desc())
+        ).all()
+
+    out: dict[str, str] = {}
+    for explanation, verdict in rows:
+        # Ordered newest first, so the first verdict seen for an explanation is the
+        # standing one. A later reversal therefore wins over an earlier approval.
+        out.setdefault(explanation, verdict)
+    return out
+
+
+def _resolved_findings(current_explanations: list[str], run_id: str) -> list[str]:
+    """Findings the parent run raised that this run no longer raises.
+
+    The interesting thing a new document does is often not what it adds but what it
+    settles, and that was invisible: a resolved finding simply stopped appearing, so
+    the only way to notice was to have memorised the previous queue. An amendment that
+    fixes a breach should say so.
+
+    Identity is the explanation string, the same key carry-forward uses. If a value
+    merely moved rather than being fixed, the old statement is genuinely no longer
+    true and a replacement appears in the new-findings queue alongside it — which is
+    the accurate reading of what happened, not a miss.
+    """
+    with session_scope() as session:
+        run = session.get(Run, UUID(run_id))
+        if run is None or run.parent_run_id is None:
+            return []
+
+        prior = session.execute(
+            select(Finding.explanation).where(Finding.run_id == run.parent_run_id)
+        ).scalars().all()
+
+    live = set(current_explanations)
+    seen: set[str] = set()
+    out: list[str] = []
+    for explanation in prior:
+        if explanation and explanation not in live and explanation not in seen:
+            seen.add(explanation)
+            out.append(explanation)
+    return out
 
 
 def get_deliverable(run_id: str) -> dict[str, Any]:

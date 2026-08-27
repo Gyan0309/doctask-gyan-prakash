@@ -437,3 +437,17 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   padding: 12px 14px;
   margin-bottom: 14px;
 }
+
+/* Resolved findings. Deliberately not styled as a warning: this is the one part of
+   the review pane reporting something that got better, and colouring it like a
+   finding would read as another problem to triage. */
+.resolved {
+  border-left: 3px solid #2f855a;
+  background: #f0fff4;
+  padding: 10px 14px;
+  margin: 10px 0 16px;
+  border-radius: 4px;
+  font-size: 0.92em;
+}
+.resolved ul { margin: 6px 0 0; padding-left: 18px; }
+.resolved li { margin: 3px 0; color: #22543d; }

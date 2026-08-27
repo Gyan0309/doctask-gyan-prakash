@@ -104,7 +104,18 @@ export default function ReviewGate({ runId, run, onDecided, onShowEvidence }) {
     setSubmitting(true);
     setError(null);
     try {
-      await api.submitDecisions(runId, verdicts);
+      // Carried verdicts are sent explicitly. The gate node treats a missing verdict
+      // as "approved", so omitting them would quietly turn a previous *rejection*
+      // into an approval — the same fail-open shape this file already guards against.
+      const payload = {
+        ...Object.fromEntries(
+          findings
+            .filter((f) => f.prior_verdict)
+            .map((f) => [String(f.index), f.prior_verdict]),
+        ),
+        ...verdicts,
+      };
+      await api.submitDecisions(runId, payload);
       await onDecided();
     } catch (err) {
       setError(err.message);
@@ -114,29 +125,70 @@ export default function ReviewGate({ runId, run, onDecided, onShowEvidence }) {
   };
 
   const setAll = (verdict) =>
-    setVerdicts(Object.fromEntries(findings.map((f) => [String(f.index), verdict])));
+    setVerdicts(Object.fromEntries(fresh.map((f) => [String(f.index), verdict])));
+
+  // Findings a human has already ruled on, byte-identical, in an earlier run. The
+  // backend only marks one when the explanation string matches exactly, so a finding
+  // whose numbers moved is never treated as already-decided.
+  const carried = findings.filter((f) => f.prior_verdict);
+  const resolved = run?.resolved_findings ?? [];
+
+  // What the reviewer is actually asked. Everything else was ruled on already, on a
+  // byte-identical finding, and re-asking is the same mistake as re-deriving a section
+  // whose facts never moved: work the system already knows the answer to.
+  const fresh = findings.filter((f) => !f.prior_verdict);
+
+
 
   // Counted from the verdicts actually recorded. The old form was
   // `rejected = findings.length - approved`, which silently reported every
   // undecided finding as rejected the moment approval stopped being the default.
   const approved = Object.values(verdicts).filter((v) => v === "approved").length;
   const rejected = Object.values(verdicts).filter((v) => v === "rejected").length;
-  const undecided = findings.length - approved - rejected;
+  const undecided = fresh.length - approved - rejected;
 
   // Severity order, not the order the pipeline happened to emit them in. A reviewer
   // working top to bottom should meet the $1.2M liability breach before a missing
   // governing-law clause, and attention is highest on the first few items.
-  const ordered = [...findings].sort(
+  const ordered = [...fresh].sort(
     (a, b) => (RANK[a.severity] ?? 9) - (RANK[b.severity] ?? 9),
   );
-  const counts = findings.reduce((acc, f) => {
+  const counts = fresh.reduce((acc, f) => {
     acc[f.severity] = (acc[f.severity] ?? 0) + 1;
     return acc;
   }, {});
 
   return (
     <section>
-      <h2>Awaiting review — {findings.length} findings</h2>
+      <h2>
+        Awaiting review — {fresh.length} new finding{fresh.length === 1 ? "" : "s"}
+      </h2>
+
+      {/* A count, not a queue. Findings already ruled on are carried with their
+          verdict and never re-listed: re-asking about a byte-identical finding is
+          the same waste as re-deriving a section whose facts never moved. */}
+      {carried.length > 0 && (
+        <p className="empty" style={{ marginTop: -4 }}>
+          {carried.length} carried forward from your earlier decisions — unchanged, so
+          not re-asked.
+        </p>
+      )}
+
+      {/* What the document settled. This is usually the most interesting thing a new
+          amendment does, and it used to be invisible: the finding simply stopped
+          appearing, so noticing required having memorised the previous queue. */}
+      {resolved.length > 0 && (
+        <div className="resolved">
+          <strong>
+            {resolved.length} resolved by this run — no longer fires:
+          </strong>
+          <ul>
+            {resolved.map((explanation) => (
+              <li key={explanation}>{explanation}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {error && <div className="error">{error}</div>}
 
@@ -151,10 +203,14 @@ export default function ReviewGate({ runId, run, onDecided, onShowEvidence }) {
         {/* Bulk verdicts still submit per item — the payload is one verdict per
             finding either way. This only saves clicks on the runs where a reviewer
             has genuinely made one decision about everything. */}
-        <div className="bulk">
-          <button onClick={() => setAll("approved")}>Approve all</button>
-          <button onClick={() => setAll("rejected")}>Reject all</button>
-        </div>
+        {/* Nothing new to rule on means nothing to bulk-apply. Leaving these live
+            offered an action with no target. */}
+        {fresh.length > 0 && (
+          <div className="bulk">
+            <button onClick={() => setAll("approved")}>Approve all</button>
+            <button onClick={() => setAll("rejected")}>Reject all</button>
+          </div>
+        )}
       </div>
 
       {ordered.map((finding) => {
@@ -216,10 +272,14 @@ export default function ReviewGate({ runId, run, onDecided, onShowEvidence }) {
         >
           {submitting
             ? "Submitting…"
-            : `Submit ${findings.length} decision${findings.length === 1 ? "" : "s"}`}
+            : fresh.length === 0
+              ? "Commit — nothing new to decide"
+              : `Submit ${fresh.length} decision${fresh.length === 1 ? "" : "s"}`}
         </button>
         <span className="tally-text">
-          {approved} approved, {rejected} rejected
+          {fresh.length === 0
+            ? `${carried.length} carried forward, nothing new to decide`
+            : `${approved} approved, ${rejected} rejected`}
           {undecided > 0 && (
             <>
               {" · "}
